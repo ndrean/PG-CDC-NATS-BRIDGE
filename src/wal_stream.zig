@@ -1,5 +1,6 @@
 const std = @import("std");
 const cdc = @import("cdc.zig");
+const pg_setup = @import("pg_setup.zig");
 
 pub const log = std.log.scoped(.wal_stream);
 
@@ -9,11 +10,7 @@ const c = @cImport({
 });
 
 pub const StreamConfig = struct {
-    host: [:0]const u8 = "127.0.0.1",
-    port: u16 = 5432,
-    user: [:0]const u8 = "postgres",
-    password: [:0]const u8 = "postgres",
-    database: [:0]const u8 = "postgres",
+    pg_config: *const pg_setup.PgSetup,
     slot_name: [:0]const u8 = "bridge_stream_slot",
     publication_name: [:0]const u8 = "bridge_stream_pub",
 };
@@ -33,18 +30,7 @@ pub const ReplicationStream = struct {
 
     pub fn connect(self: *ReplicationStream) !void {
         // Build connection string with replication=database parameter
-        const conninfo = try std.fmt.allocPrintSentinel(
-            self.allocator,
-            "host={s} port={d} user={s} password={s} dbname={s} replication=database",
-            .{
-                self.config.host,
-                self.config.port,
-                self.config.user,
-                self.config.password,
-                self.config.database,
-            },
-            0,
-        );
+        const conninfo = try self.config.pg_config.connInfo(self.allocator, true);
         defer self.allocator.free(conninfo);
 
         log.info("Connecting to PostgreSQL for replication...", .{});

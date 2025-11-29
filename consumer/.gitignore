@@ -24,4 +24,4 @@ erl_crash.dump
 
 # Ignore package tarball (built via "mix hex.build").
 consumer-*.tar
-
+AGENTS.md

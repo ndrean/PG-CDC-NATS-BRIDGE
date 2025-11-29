@@ -1,0 +1,49 @@
+services:
+  bridge-valgrind:
+    build:
+      context: .
+      dockerfile: Dockerfile.valgrind
+    container_name: bridge-valgrind
+    networks:
+      - cdc-bridge
+    ports:
+      - "9090:8080"
+    command: >
+      valgrind
+        --leak-check=full
+        --show-leak-kinds=all
+        --track-origins=yes
+        --verbose
+        --log-fd=1
+        bridge
+        --stream CDC_VALGRIND
+        --slot valgrind_slot
+        --publication valgrind_pub
+        --port 8080
+    depends_on:
+      - postgres
+      - nats-server
+    environment:
+      POSTGRES_HOST: postgres
+      NATS_HOST: nats-server
+
+  # Reference the existing services from your main docker-compose
+  postgres:
+    extends:
+      file: docker-compose.yml
+      service: postgres
+
+  nats-server:
+    extends:
+      file: docker-compose.yml
+      service: nats-server
+
+volumes:
+  postgres-data:
+    driver: local
+  nats-data:
+    driver: local
+
+networks:
+  cdc-bridge:
+    external: true

@@ -7,7 +7,7 @@ zig-cache/
 nats-data/
 
 # Dependencies (vendored)
-libs/
+
 
 # IDE
 .vscode/

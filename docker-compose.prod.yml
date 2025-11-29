@@ -1,0 +1,45 @@
+services:
+  bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bridge
+    networks:
+      - cdc-bridge
+    ports:
+      - "8080:8080"
+    command: >
+      bridge
+        --stream CDC
+        --slot cdc_slot
+        --publication cdc_pub
+        --port 8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats-server:
+        condition: service_started
+    environment:
+      POSTGRES_HOST: postgres
+      NATS_HOST: nats-server
+    restart: unless-stopped
+
+  postgres:
+    extends:
+      file: docker-compose.yml
+      service: postgres
+
+  nats-server:
+    extends:
+      file: docker-compose.yml
+      service: nats-server
+
+volumes:
+  postgres-data:
+    driver: local
+  nats-data:
+    driver: local
+
+networks:
+  cdc-bridge:
+    driver: bridge

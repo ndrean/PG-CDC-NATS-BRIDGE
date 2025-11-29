@@ -1,18 +1,93 @@
 const std = @import("std");
 
+/// Build nats.c library using CMake
+fn buildNats(b: *std.Build) *std.Build.Step {
+    const nats_step = b.step("build-nats", "Build nats.c library using CMake");
+
+    // Check if library already exists
+    const nats_lib_path = "libs/nats-install/lib/libnats_static.a";
+    const nats_lib_exists = blk: {
+        std.fs.cwd().access(nats_lib_path, .{}) catch {
+            break :blk false;
+        };
+        break :blk true;
+    };
+
+    if (nats_lib_exists) {
+        std.debug.print("nats.c library already built at {s}\n", .{nats_lib_path});
+        return nats_step;
+    }
+
+    // Create build directory
+    const mkdir_cmd = b.addSystemCommand(&.{ "mkdir", "-p", "libs/nats.c/build" });
+    nats_step.dependOn(&mkdir_cmd.step);
+
+    // Run CMake configure
+    const cmake_cmd = b.addSystemCommand(&.{
+        "cmake",
+        "-S",
+        "libs/nats.c",
+        "-B",
+        "libs/nats.c/build",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DBUILD_TESTING=OFF",
+        "-DNATS_BUILD_STREAMING=OFF",
+        "-DNATS_BUILD_WITH_TLS=OFF",
+        "-DNATS_BUILD_EXAMPLES=OFF",
+        "-DNATS_BUILD_LIB_SHARED=OFF",
+        "-DCMAKE_INSTALL_PREFIX=libs/nats-install",
+    });
+    cmake_cmd.step.dependOn(&mkdir_cmd.step);
+    nats_step.dependOn(&cmake_cmd.step);
+
+    // Run CMake build
+    const build_cmd = b.addSystemCommand(&.{
+        "cmake",
+        "--build",
+        "libs/nats.c/build",
+        "--config",
+        "Release",
+    });
+    build_cmd.step.dependOn(&cmake_cmd.step);
+    nats_step.dependOn(&build_cmd.step);
+
+    // Run CMake install
+    const install_cmd = b.addSystemCommand(&.{
+        "cmake",
+        "--install",
+        "libs/nats.c/build",
+    });
+    install_cmd.step.dependOn(&build_cmd.step);
+    nats_step.dependOn(&install_cmd.step);
+
+    return nats_step;
+}
+
 /// Link vendored libpq static libraries to an executable
 fn linkLibpq(exe: *std.Build.Step.Compile, b: *std.Build) void {
-    // Add include path for headers
-    exe.addIncludePath(b.path("libs/libpq-install/include"));
+    // Check if vendored libpq exists
+    const vendored_libpq_exists = blk: {
+        std.fs.cwd().access("libs/libpq-install/lib/libpq.a", .{}) catch {
+            break :blk false;
+        };
+        break :blk true;
+    };
 
-    // Add library path
-    exe.addLibraryPath(b.path("libs/libpq-install/lib"));
-
-    // Link the static libraries in correct order: pgcommon and pgport first, then pq
-    // This is important because libpq depends on symbols from pgcommon and pgport
-    exe.addObjectFile(b.path("libs/libpq-install/lib/libpgcommon.a"));
-    exe.addObjectFile(b.path("libs/libpq-install/lib/libpgport.a"));
-    exe.addObjectFile(b.path("libs/libpq-install/lib/libpq.a"));
+    if (vendored_libpq_exists) {
+        // Use vendored libpq
+        exe.addIncludePath(b.path("libs/libpq-install/include"));
+        exe.addLibraryPath(b.path("libs/libpq-install/lib"));
+        exe.addObjectFile(b.path("libs/libpq-install/lib/libpgcommon.a"));
+        exe.addObjectFile(b.path("libs/libpq-install/lib/libpgport.a"));
+        exe.addObjectFile(b.path("libs/libpq-install/lib/libpq.a"));
+        std.debug.print("Using vendored libpq from libs/libpq-install\n", .{});
+    } else {
+        // Use system libpq (e.g., in Docker/Debian/Alpine)
+        // Add system include paths for PostgreSQL headers
+        exe.addSystemIncludePath(.{ .cwd_relative = "/usr/include/postgresql" });
+        exe.linkSystemLibrary("pq");
+        std.debug.print("Using system libpq\n", .{});
+    }
 
     // Link system dependencies that libpq needs
     exe.linkLibC();
@@ -22,14 +97,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const mod = b.addModule("bridge", .{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-    });
+    // Build nats.c library if needed
+    const nats_build_step = buildNats(b);
 
-    const pg = b.dependency("pg", .{
+    const mod = b.addModule("bridge", .{
+        .root_source_file = b.path("src/bridge.zig"),
         .target = target,
-        .optimize = optimize,
     });
 
     const msgpack = b.dependency("zig_msgpack", .{
@@ -40,39 +113,43 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "bridge",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("src/bridge.zig"),
 
             .target = target,
             .optimize = optimize,
 
             .imports = &.{
                 .{ .name = "bridge", .module = mod },
-                .{ .name = "pg", .module = pg.module("pg") },
                 .{ .name = "msgpack", .module = msgpack.module("msgpack") },
             },
         }),
     });
 
-    // Link against pre-built NATS C library
-    // Build the library first by running: ./build_nats.sh
+    // Ensure nats.c is built before compiling
+    exe.step.dependOn(nats_build_step);
+
+    // Link against NATS C library
     exe.addIncludePath(b.path("libs/nats-install/include"));
     exe.addLibraryPath(b.path("libs/nats-install/lib"));
     exe.addObjectFile(b.path("libs/nats-install/lib/libnats_static.a"));
-    exe.linkLibC();
+
+    // Link vendored libpq
+    linkLibpq(exe, b);
 
     b.installArtifact(exe);
 
+    // A top-level step to build and run the application with `zig build run`
     const run_step = b.step("run", "Run the app");
-
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
-
     run_cmd.step.dependOn(b.getInstallStep());
 
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
 
+    // ===== Test executables =====
+    // Creates an executable that will run `test` blocks from the module.
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
@@ -96,6 +173,11 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // Clean nats build artifacts
+    const clean_nats_step = b.step("clean-nats", "Clean nats.c build artifacts");
+    const rm_nats_build = b.addSystemCommand(&.{ "rm", "-rf", "libs/nats.c/build", "libs/nats-install" });
+    clean_nats_step.dependOn(&rm_nats_build.step);
 
     // ===== Commented out test executables - files moved to src/test_files/ =====
     // Uncomment and update paths if needed for testing
@@ -209,32 +291,6 @@ pub fn build(b: *std.Build) void {
     // const wal_stream_test_run = b.addRunArtifact(wal_stream_test);
     // wal_stream_test_run.step.dependOn(b.getInstallStep());
     // wal_stream_test_step.dependOn(&wal_stream_test_run.step);
-
-    // Bridge Demo - End-to-end CDC to NATS
-    const bridge_demo = b.addExecutable(.{
-        .name = "bridge_demo",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bridge_demo.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "pg", .module = pg.module("pg") },
-                .{ .name = "msgpack", .module = msgpack.module("msgpack") },
-            },
-        }),
-    });
-    // Link NATS
-    bridge_demo.addIncludePath(b.path("libs/nats-install/include"));
-    bridge_demo.addLibraryPath(b.path("libs/nats-install/lib"));
-    bridge_demo.addObjectFile(b.path("libs/nats-install/lib/libnats_static.a"));
-    // Link vendored libpq
-    linkLibpq(bridge_demo, b);
-    b.installArtifact(bridge_demo);
-
-    const bridge_demo_step = b.step("bridge-demo", "Run end-to-end CDC bridge demo");
-    const bridge_demo_run = b.addRunArtifact(bridge_demo);
-    bridge_demo_run.step.dependOn(b.getInstallStep());
-    bridge_demo_step.dependOn(&bridge_demo_run.step);
 
     // // Connection State Test
     // const conn_state_test = b.addExecutable(.{

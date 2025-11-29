@@ -19,10 +19,10 @@ config :logger, :default_formatter,
 # of this file so it overrides the configuration defined above.
 import_config "#{config_env()}.exs"
 
-# config :consumer,
-#   ecto_repos: [Producer.Repo],
-#   generators: [timestamp_type: :utc_datetime]
+config :consumer,
+  ecto_repos: [Producer.Repo],
+  generators: [timestamp_type: :utc_datetime]
 
-# config :consumer, Producer.Repo,
-#   url: System.get_env("DATABASE_URL") || "ecto://postgres:postgres@localhost/bridge_demo_users",
-#   pool_size: String.to_integer(System.get_env("POOL_SIZE") || "5")
+config :consumer, Producer.Repo,
+  url: System.get_env("DATABASE_URL") || "ecto://postgres:postgres@localhost/postgres",
+  pool_size: String.to_integer(System.get_env("POOL_SIZE") || "5")

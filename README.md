@@ -167,10 +167,10 @@ zig build
 # Build all executables (default)
 zig build
 
-# Run the main CDC bridge demo
-zig build bridge-demo
+# Run the main CDC bridge
+zig build run
 # or directly:
-./zig-out/bin/bridge_demo --stream CDC_BRIDGE
+./zig-out/bin/bridge --stream CDC_BRIDGE
 
 # Run tests
 zig build test
@@ -236,9 +236,9 @@ The PostgeSQL and NATS server are run via the Docker daemon (_docker-compose.yml
 Start the bridge with:
 
 ```bash
-./zig-out/bin/bridge_demo --stream CDC_BRIDGE
+./zig-out/bin/bridge --stream CDC_BRIDGE
 # or with custom HTTP port:
-./zig-out/bin/bridge_demo --stream CDC_BRIDGE --port 9090
+./zig-out/bin/bridge --stream CDC_BRIDGE --port 9090
 ```
 
 **Available options:**
@@ -249,7 +249,7 @@ Start the bridge with:
 
 The bridge will:
 
-1. Set up replication slot (`bridge_demo_slot`) and publication (`bridge_demo_pub`)
+1. Set up replication slot (`bridge_slot`) and publication (`bridge_pub`)
 2. Connect to NATS JetStream and create the specified stream
 3. Start HTTP server on specified port (health, metrics, stream management)
 4. Start WAL lag monitor (checks every 30 seconds)
@@ -302,11 +302,11 @@ Run multiple bridge instances, each with its own replication slot and stream:
 
 ```bash
 # Terminal 1: Stream for real-time processing
-./zig-out/bin/bridge_demo --stream CDC_REALTIME
+./zig-out/bin/bridge --stream CDC_REALTIME
 
 # Terminal 2: Stream for analytics (separate slot: bridge_analytics_slot)
 # Requires code change to use different slot_name and publication_name
-./zig-out/bin/bridge_demo --stream CDC_ANALYTICS
+./zig-out/bin/bridge --stream CDC_ANALYTICS
 ```
 
 **HTTP stream management endpoints** are provided for administrative tasks:
@@ -499,7 +499,7 @@ Returns bridge status as JSON for programmatic access:
 The bridge emits structured metric logs to **stdout** every **15 seconds**:
 
 ```log
-info(bridge_demo): METRICS uptime=15 wal_messages=2 cdc_events=0 lsn=0/183f680 connected=1 reconnects=0 lag_bytes=51608 slot_active=1 processing_time_us=0
+info(bridge): METRICS uptime=15 wal_messages=2 cdc_events=0 lsn=0/183f680 connected=1 reconnects=0 lag_bytes=51608 slot_active=1 processing_time_us=0
 ```
 
 Configure Grafana Alloy to parse these logs and extract metrics using regex or logfmt parser.
@@ -561,7 +561,7 @@ postgres:
 **Terminal 1 - Start the bridge:**
 
 ```sh
-./zig-out/bin/bridge_demo --stream CDC_BRIDGE
+./zig-out/bin/bridge --stream CDC_BRIDGE
 ```
 
 **Terminal 2 - Generate CDC events:**
@@ -630,7 +630,7 @@ docker exec -it postgres psql -U postgres -c "
   SELECT slot_name, active,
          pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) as lag
   FROM pg_replication_slots
-  WHERE slot_name = 'bridge_demo_slot';
+  WHERE slot_name = 'bridge_slot';
 "
 ```
 
@@ -644,7 +644,7 @@ docker exec -it postgres psql -U postgres -c "
 Kill my zombies!!!
 
 ```sh
-ps aux | grep bridge_demo | grep -v grep
+ps aux | grep bridge | grep -v grep
 ```
 
 ## License

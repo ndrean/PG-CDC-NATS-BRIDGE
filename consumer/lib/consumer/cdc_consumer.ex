@@ -34,9 +34,9 @@ defmodule Consumer.CdcConsumer do
   def handle_message(message, state) do
     try do
       # Decode MessagePack payload
-      decoded = Msgpax.unpack!(message.body)
+      _decoded = Msgpax.unpack!(message.body)
 
-      Logger.info("[CDC Consumer] #{message.topic}: #{inspect(decoded)}")
+      # Logger.info("[CDC Consumer] #{message.topic}: #{inspect(decoded)}")
 
       # Acknowledge successful processing
       {:ack, state}
@@ -67,7 +67,7 @@ defmodule Consumer.CdcConsumer do
       _pid ->
         # ensure JetStream is enabled by the server
         true = Gnat.server_info(:gnat).jetstream
-        Logger.info("[CDC Consumer] ✓ NATS connection established with JetStream enabled")
+        Logger.info("[CDC Consumer] ❇️ NATS connection established with JetStream enabled")
         :ok
     end
   end
@@ -78,12 +78,12 @@ defmodule Consumer.CdcConsumer do
     # Stream is created by Zig bridge, just verify it exists
     case Gnat.Jetstream.API.Stream.info(:gnat, stream_name) do
       {:ok, _stream_info} ->
-        Logger.info("[CDC Consumer] ✓ Using JetStream stream '#{stream_name}'")
+        Logger.info("[CDC Consumer] ❇️ Using JetStream stream '#{stream_name}'")
         :ok
 
       {:error, reason} ->
         Logger.warning(
-          "[CDC Consumer] Stream '#{stream_name}' not found: #{inspect(reason)}. Make sure Zig bridge is running and has created this exact stream."
+          "[CDC Consumer] 🔴 Stream '#{stream_name}' not found: #{inspect(reason)}. Make sure Zig bridge is running and has created this exact stream."
         )
 
         raise "JetStream stream '#{stream_name}' not found"
@@ -95,15 +95,15 @@ defmodule Consumer.CdcConsumer do
 
     case Gnat.Jetstream.API.Consumer.create(:gnat, consumer_config) do
       {:ok, %{created: _}} ->
-        Logger.info("[CDC Consumer] ✓ Durable consumer '#{consumer_name}' created")
+        Logger.info("[CDC Consumer] ❇️ Durable consumer '#{consumer_name}' created")
         :ok
 
       {:error, %{"code" => 400, "description" => "consumer name already in use"}} ->
-        Logger.info("[CDC Consumer] ✓ Durable consumer '#{consumer_name}' already exists")
+        Logger.info("[CDC Consumer] ❇️ Durable consumer '#{consumer_name}' already exists")
         :ok
 
       {:error, reason} ->
-        Logger.error("[CDC Consumer] Failed to create consumer: #{inspect(reason)}")
+        Logger.error("[CDC Consumer] 🔴 Failed to create consumer: #{inspect(reason)}")
         raise "Failed to setup JetStream consumer"
     end
   end

@@ -2,17 +2,14 @@ const std = @import("std");
 const c = @cImport({
     @cInclude("libpq-fe.h");
 });
+const pg_setup = @import("pg_setup.zig");
 const metrics_mod = @import("metrics.zig");
 
 pub const log = std.log.scoped(.wal_monitor);
 
 /// Configuration for WAL monitoring
 pub const Config = struct {
-    host: []const u8,
-    port: u16,
-    user: []const u8,
-    password: []const u8,
-    database: []const u8,
+    pg_config: *const pg_setup.PgSetup,
     slot_name: []const u8,
     check_interval_seconds: u32 = 30,
 };
@@ -24,7 +21,7 @@ pub fn monitorWalLag(
     should_stop: *std.atomic.Value(bool),
     allocator: std.mem.Allocator,
 ) !void {
-    log.info("WAL lag monitor started (checking every {d}s)", .{config.check_interval_seconds});
+    log.info(" WAL lag monitor started (checking every {d}s)\n", .{config.check_interval_seconds});
 
     while (!should_stop.load(.seq_cst)) {
         // Check WAL lag
@@ -40,7 +37,7 @@ pub fn monitorWalLag(
         }
     }
 
-    log.info("WAL lag monitor stopped", .{});
+    log.info("WAL lag monitor stopped\n", .{});
 }
 
 fn checkWalLag(
@@ -49,20 +46,11 @@ fn checkWalLag(
     allocator: std.mem.Allocator,
 ) !void {
     // Build connection string
-    const conninfo_str = try std.fmt.allocPrint(
-        allocator,
-        "host={s} port={d} user={s} password={s} dbname={s}",
-        .{ config.host, config.port, config.user, config.password, config.database },
-    );
-    defer allocator.free(conninfo_str);
-    const conninfo = try allocator.dupeZ(u8, conninfo_str);
+    const conninfo = try config.pg_config.connInfo(allocator, false);
     defer allocator.free(conninfo);
 
-    // Connect to PostgreSQL
     const conn = c.PQconnectdb(conninfo.ptr);
-    if (conn == null) {
-        return error.ConnectionFailed;
-    }
+
     defer c.PQfinish(conn);
 
     if (c.PQstatus(conn) != c.CONNECTION_OK) {

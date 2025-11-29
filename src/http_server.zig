@@ -21,7 +21,7 @@ pub const Server = struct {
     ) !Server {
         return Server{
             .allocator = allocator,
-            .address = try std.net.Address.parseIp4("127.0.0.1", port),
+            .address = try std.net.Address.parseIp4("0.0.0.0", port),
             .should_stop = should_stop,
             .metrics = metrics,
             .nats_publisher = nats_pub,
@@ -35,7 +35,7 @@ pub const Server = struct {
         });
         defer server.deinit();
 
-        log.info("HTTP server listening on http://127.0.0.1:{d}", .{self.address.getPort()});
+        log.info("HTTP server listening on http://0.0.0.0:{d}", .{self.address.getPort()});
         log.info("Available endpoints:", .{});
         log.info("  GET  /health         - Health check", .{});
         log.info("  GET  /status         - Bridge status (JSON)", .{});

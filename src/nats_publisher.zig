@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const log = std.log.scoped(.nats_publisher);
+pub const log = std.log.scoped(.nats_pub);
 
 // Import NATS C library
 const c = @cImport({
@@ -9,7 +9,7 @@ const c = @cImport({
 
 /// NATS Publisher Configuration
 pub const PublisherConfig = struct {
-    url: [:0]const u8 = "nats://localhost:4222",
+    url: [:0]const u8 = "nats://127.0.0.1:4222",
 };
 
 /// JetStream Stream Configuration
@@ -76,13 +76,28 @@ pub const Publisher = struct {
     config: PublisherConfig,
     nc: ?*c.natsConnection = null,
     js: ?*c.jsCtx = null,
+    nats_host: [:0]const u8 = "",
 
     pub fn init(allocator: std.mem.Allocator, config: PublisherConfig) !Publisher {
+        const nats_uri = std.process.getEnvVarOwned(allocator, "NATS_HOST") catch |err| blk: {
+            log.info("NATS_HOST env var not set ({}), using default 127.0.0.1", .{err});
+            break :blk try allocator.dupe(u8, "127.0.0.1");
+        };
+        defer allocator.free(nats_uri);
+
+        const url: [:0]const u8 = try std.fmt.allocPrintSentinel(
+            allocator,
+            "nats://{s}:4222",
+            .{nats_uri},
+            0,
+        );
+
         return Publisher{
             .allocator = allocator,
             .config = config,
             .nc = null,
             .js = null,
+            .nats_host = url,
         };
     }
 
@@ -99,14 +114,14 @@ pub const Publisher = struct {
         defer c.natsOptions_Destroy(opts);
 
         // Set server URL
-        status = c.natsOptions_SetURL(opts, self.config.url.ptr);
+        status = c.natsOptions_SetURL(opts, self.nats_host.ptr);
         if (status != c.NATS_OK) {
             log.err("Failed to set NATS URL: {s}", .{c.natsStatus_GetText(status)});
             return error.NatsSetURLFailed;
         }
 
         // Connect to NATS
-        log.info("Connecting to NATS at {s}...", .{self.config.url});
+        log.info("Connecting to NATS at {s} ...", .{self.nats_host});
         status = c.natsConnection_Connect(&self.nc, opts);
         if (status != c.NATS_OK) {
             log.err("Failed to connect to NATS: {s}", .{c.natsStatus_GetText(status)});
@@ -135,6 +150,12 @@ pub const Publisher = struct {
             c.natsConnection_Destroy(nc);
             self.nc = null;
         }
+
+        if (self.nats_host.len > 0) {
+            self.allocator.free(self.nats_host);
+        }
+        self.nats_host = "";
+
         log.info("Disconnected from NATS", .{});
     }
 
