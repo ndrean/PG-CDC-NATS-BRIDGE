@@ -1,7 +1,3 @@
-//! WAL streaming module for PostgreSQL logical replication
-//!
-//! Handles connecting to PostgreSQL in replication mode, starting replication from a slot,
-//! receiving WAL messages ('k' and ''), and sending status updates.
 const std = @import("std");
 const pg_conn = @import("pg_conn.zig");
 
@@ -41,13 +37,13 @@ pub const ReplicationStream = struct {
 
         if (c.PQstatus(self.conn) != c.CONNECTION_OK) {
             const err_msg = c.PQerrorMessage(self.conn);
-            log.err("🔴 Connection failed: {s}", .{err_msg});
+            log.err("Connection failed: {s}", .{err_msg});
             c.PQfinish(self.conn);
             self.conn = null;
             return error.ConnectionFailed;
         }
 
-        log.info("✅ Connected to PostgreSQL (replication mode)", .{});
+        log.info("✓ Connected to PostgreSQL (replication mode)", .{});
     }
 
     pub fn deinit(self: *ReplicationStream) void {
@@ -55,7 +51,7 @@ pub const ReplicationStream = struct {
             c.PQfinish(conn);
             self.conn = null;
         }
-        log.info("🥁 Disconnected from PostgreSQL", .{});
+        log.info("Disconnected from PostgreSQL", .{});
     }
 
     /// Start streaming from the replication slot
@@ -67,16 +63,17 @@ pub const ReplicationStream = struct {
         // Determine starting LSN (default to 0/0 if not provided)
         const lsn = start_lsn orelse "0/0";
 
-        // Build START_REPLICATION command
+        // Build START_REPLICATION command for decoderbufs
+        // decoderbufs doesn't use proto_version or publication_names options
         const query = try std.fmt.allocPrintSentinel(
             self.allocator,
-            "START_REPLICATION SLOT {s} LOGICAL {s} (proto_version '1', publication_names '{s}')",
-            .{ self.config.slot_name, lsn, self.config.publication_name },
+            "START_REPLICATION SLOT {s} LOGICAL {s}",
+            .{ self.config.slot_name, lsn },
             0,
         );
         defer self.allocator.free(query);
 
-        log.info("Starting replication...", .{});
+        log.info("Starting replication: {s}", .{query});
 
         const result = c.PQexec(self.conn, query.ptr);
         defer c.PQclear(result);
@@ -84,12 +81,12 @@ pub const ReplicationStream = struct {
         const status = c.PQresultStatus(result);
         if (status != c.PGRES_COPY_BOTH) {
             const err_msg = c.PQerrorMessage(self.conn);
-            log.err("🔴 START_REPLICATION failed: {s}", .{err_msg});
-            log.err("🔴 Expected COPY_BOTH mode, got status: {d}", .{status});
+            log.err("START_REPLICATION failed: {s}", .{err_msg});
+            log.err("Expected COPY_BOTH mode, got status: {d}", .{status});
             return error.StartReplicationFailed;
         }
 
-        log.info("✅ Replication started successfully", .{});
+        log.info("✓ Replication started successfully", .{});
     }
 
     /// Receive one WAL message from the stream
@@ -102,7 +99,7 @@ pub const ReplicationStream = struct {
         // This reads data from the network into libpq's internal buffer
         if (c.PQconsumeInput(self.conn) == 0) {
             const err_msg = c.PQerrorMessage(self.conn);
-            log.err("🔴 PQconsumeInput error: {s}", .{err_msg});
+            log.err("PQconsumeInput error: {s}", .{err_msg});
             return error.ConsumeInputFailed;
         }
 
@@ -124,12 +121,12 @@ pub const ReplicationStream = struct {
             return null;
         } else if (result == -1) {
             // End of copy stream
-            log.info("⚠️ Replication stream ended", .{});
+            log.info("Replication stream ended", .{});
             return error.StreamEnded;
         } else {
             // Error (-2)
             const err_msg = c.PQerrorMessage(self.conn);
-            log.err("🔴 PQgetCopyData error: {s}", .{err_msg});
+            log.err("PQgetCopyData error: {s}", .{err_msg});
             return error.CopyDataFailed;
         }
     }
@@ -230,7 +227,7 @@ pub const ReplicationStream = struct {
         const result = c.PQputCopyData(self.conn, @ptrCast(&buffer), buffer.len);
         if (result != 1) {
             const err_msg = c.PQerrorMessage(self.conn);
-            log.err("⚠️ Failed to send status update: {s}", .{err_msg});
+            log.err("Failed to send status update: {s}", .{err_msg});
             return error.StatusUpdateFailed;
         }
 
@@ -238,7 +235,7 @@ pub const ReplicationStream = struct {
         const flush_result = c.PQflush(self.conn);
         if (flush_result == -1) {
             const err_msg = c.PQerrorMessage(self.conn);
-            log.err("⚠️ Failed to flush status update: {s}", .{err_msg});
+            log.err("Failed to flush status update: {s}", .{err_msg});
             return error.FlushFailed;
         }
 

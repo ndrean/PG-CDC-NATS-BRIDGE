@@ -1,10 +1,12 @@
+//! Parser for PostgreSQL logical replication protocol
 const std = @import("std");
-const cdc = @import("cdc.zig");
 
 pub const log = std.log.scoped(.pgoutput);
 
 /// pgoutput protocol parser
+///
 /// Parses PostgreSQL logical replication binary messages
+///
 /// Spec: https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html
 pub const PgOutputMessage = union(enum) {
     begin: BeginMessage,
@@ -18,18 +20,149 @@ pub const PgOutputMessage = union(enum) {
     truncate: TruncateMessage,
 };
 
+/// pgoutput message BEGIN structures
 pub const BeginMessage = struct {
     final_lsn: u64,
     timestamp: i64,
     xid: u32,
 };
 
+/// pgoutput message COMMIT structures
 pub const CommitMessage = struct {
     flags: u8,
     commit_lsn: u64,
     end_lsn: u64,
     timestamp: i64,
 };
+
+/// PostgreSQL built-in Type OIDs (Object IDs).
+/// These values are standard.
+pub const PgOid = enum(u32) {
+    // Numeric Types
+    BOOL = 16,
+    INT2 = 21, // smallint
+    INT4 = 23, // integer
+    INT8 = 20, // bigint
+    FLOAT4 = 700,
+    FLOAT8 = 701,
+
+    // Character Types
+    TEXT = 25,
+    VARCHAR = 1043,
+    BPCHAR = 1042, // char(n)
+
+    // Date/Time Types
+    DATE = 1082,
+    TIMESTAMPTZ = 1184, // timestamp with time zone (8 bytes)
+
+    // Others
+    UUID = 2950,
+    BYTEA = 17,
+    JSONB = 3802,
+    NUMERIC = 1700,
+    _, // Placeholder for unsupported types
+};
+
+/// Decoded column value representation
+pub const DecodedValue = union(enum) {
+    int32: i32,
+    int64: i64,
+    float64: f64,
+    boolean: bool,
+    text: []const u8,
+    // Add more types as you implement them (e.g., date, timestamp, bytea)
+};
+
+/// Decodes the raw bytes based on the PostgreSQL type OID.
+///
+/// Note: pgoutput sends data in TEXT format by default, not binary!
+/// raw_bytes contains the UTF-8 text representation of the value.
+pub fn decodeColumnData(
+    _: std.mem.Allocator,
+    type_id: u32,
+    raw_bytes: []const u8,
+) !DecodedValue {
+    // What if type_id is not in PgOid?
+    const oid: PgOid = @enumFromInt(type_id);
+    // catch {
+    //     // Fallback for unsupported OIDs (e.g., arrays, custom types, numeric)
+    //     return error.UnsupportedType;
+    // };
+
+    return switch (oid) {
+        // --- 1. Fixed-Width Types (Simple reads) ----------------------
+
+        // BOOL - text format is "t" or "f"
+        .BOOL => {
+            if (raw_bytes.len == 0) return error.InvalidDataLength;
+            return .{ .boolean = raw_bytes[0] == 't' };
+        },
+
+        // INT2 - parse text as integer
+        .INT2 => {
+            const val = try std.fmt.parseInt(i16, raw_bytes, 10);
+            return .{ .int32 = @intCast(val) };
+        },
+
+        // INT4 - parse text as integer
+        .INT4 => {
+            const val = try std.fmt.parseInt(i32, raw_bytes, 10);
+            return .{ .int32 = val };
+        },
+
+        // INT8 - parse text as integer
+        .INT8 => {
+            const val = try std.fmt.parseInt(i64, raw_bytes, 10);
+            return .{ .int64 = val };
+        },
+
+        // TIMESTAMPTZ - parse text timestamp
+        .TIMESTAMPTZ => {
+            // PostgreSQL text format for timestamptz: "2025-11-30 20:13:29.377405+00"
+            // For now, text representation
+            // TODO: Parse into actual timestamp
+            return .{ .text = raw_bytes };
+        },
+
+        // FLOAT8 - parse text as float
+        .FLOAT8 => {
+            const val = try std.fmt.parseFloat(f64, raw_bytes);
+            return .{ .float64 = val };
+        },
+
+        // DATE - parse text date "YYYY-MM-DD"
+        .DATE => {
+            // For now, text representation
+            // TODO: Parse into days since 2000-01-01
+            return .{ .text = raw_bytes };
+        },
+
+        // UUID - text format is "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+        .UUID => {
+            // pgoutput sends UUID in text format, already formatted
+            return .{ .text = raw_bytes };
+        },
+
+        // --- 2. Variable-Length Types (The raw bytes are the value) ---
+
+        // TEXT, VARCHAR, BPCHAR. The bytes are already the UTF-8 text string.
+        .TEXT, .VARCHAR, .BPCHAR => {
+            // Note: The bytes retrieved by parseTupleData are already a dynamically allocated slice
+            // of the text content (assuming it's not TOASTed/unchanged, which current code handles).
+            return .{ .text = raw_bytes };
+        },
+
+        // BYTEA. The bytes are the raw binary content.
+        .BYTEA => {
+            return .{ .text = raw_bytes }; // Representing as raw byte slice
+        },
+
+        // --- 3. TODO Complex/Other Types ------------------------------------
+
+        // specific decoding logic: JSONB, NUMERIC, Arrays, UUID (16 bytes)
+        else => return error.UnsupportedType,
+    };
+}
 
 pub const RelationMessage = struct {
     relation_id: u32,
@@ -150,7 +283,34 @@ pub const TupleData = struct {
     }
 };
 
+pub fn decodeTuple(
+    allocator: std.mem.Allocator,
+    tuple: TupleData,
+    columns: []const RelationMessage.ColumnInfo,
+) !std.StringHashMap(DecodedValue) {
+    var decoded_map = std.StringHashMap(DecodedValue).init(allocator);
+    errdefer decoded_map.deinit();
+
+    if (tuple.columns.len != columns.len) return error.ColumnMismatch;
+
+    for (columns, tuple.columns) |col_info, col_data| {
+        if (col_data) |raw_bytes| {
+            const decoded_value = decodeColumnData(allocator, col_info.type_id, raw_bytes) catch |err| {
+                log.err("Failed to decode column '{s}' (type_id={d}, bytes={d}): {}", .{ col_info.name, col_info.type_id, raw_bytes.len, err });
+                return err;
+            };
+            try decoded_map.put(col_info.name, decoded_value);
+        } else {
+            // Handle NULL values
+            // skip? or use a custom DecodedValue union option for NULL?)
+        }
+    }
+    return decoded_map;
+}
+
 /// Parser state for decoding pgoutput messages
+///
+/// Handles reading from a byte slice and parsing messages sequentially
 pub const Parser = struct {
     allocator: std.mem.Allocator,
     data: []const u8,

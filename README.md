@@ -534,6 +534,14 @@ loki.process "extract_metrics" {
 }
 ```
 
+## WAL parsing
+
+The RelationMessage ('R') comes before any Insert/Update/Delete messages and tells you: Column names, Column type OIDs (for decodeColumnData), Type modifiers.
+
+Without caching it, you can't decode the tuple data because Tuple data only has raw bytes - no column names or type info.
+You need the type_id from the RelationMessage to call decodeColumnData(type_id, raw_bytes).
+RelationMessages are sent once per table at the start, then only Insert/Update/Delete messages follow.
+
 ## PostgreSQL Configuration
 
 ### WAL Sender Timeout
@@ -574,6 +582,10 @@ iex> Producer.run_test(100)
 
 # Parallel load test: 100 batches of 10 events each
 iex> Stream.interval(500) |> Stream.take(100) |> Task.async_stream(fn _ -> Producer.run_test(10) end) |> Enum.to_list()
+```
+
+```sh
+docker exec postgres psql -U postgres -c "CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT, created_at TIMESTAMPTZ DEFAULT now());"
 ```
 
 ### HTTP Endpoint Tests
@@ -633,6 +645,69 @@ docker exec -it postgres psql -U postgres -c "
   WHERE slot_name = 'bridge_slot';
 "
 ```
+
+## Protobuf
+
+The decoderbufs protobuf schema is **universal/generic**.
+It's designed to represent CDC events for _ANY_ table structure.
+
+Here's how it works: The schema defines generic structures like:
+
+- RowMessage - represents a single row change
+- DatumMessage - represents a column value with metadata
+- Column names and types are included dynamically in each message
+
+So when you get an INSERT on the users table, the protobuf message contains:
+
+```proto
+RowMessage {
+  operation: INSERT
+  table: "users"
+  new_tuple: [
+    DatumMessage { column_name: "id", column_type: INT4, datum_int32: 123 },
+    DatumMessage { column_name: "name", column_type: TEXT, datum_string: "User 123" },
+    DatumMessage { column_name: "email", column_type: TEXT, datum_string: "user123@example.com" }
+  ]
+}
+```
+
+The same schema works for the orders table:
+
+```proto
+RowMessage {
+  operation: INSERT
+  table: "orders"
+  new_tuple: [
+    DatumMessage { column_name: "id", column_type: INT4, datum_int32: 456 },
+    DatumMessage { column_name: "user_id", column_type: INT4, datum_int32: 123 },
+    DatumMessage { column_name: "total", column_type: NUMERIC, datum_double: 99.99 }
+  ]
+}
+```
+
+What you need:
+
+- The decoderbufs .proto schema file (from Debezium project)
+- Use `zig-protobuf` to generate Zig code from that schema: `zig build gen-proto`
+- Use the same generated code for all tables
+- provides `RowMessage` struct with `declde()` method, and all necessary types.
+- you make a _pb_parser.zig_ wrapper around protobuf with helpers to convert operations and datum values to strings.
+
+It's a generic CDC format that works for any table schema without requiring custom protobuf definitions per table.
+
+**What the Protobuf Schema Provides**:  The RowMessage struct contains:
+
+- table: Table name (e.g., "users", "orders")
+- op: Operation type (INSERT, UPDATE, DELETE)
+- new_tuple: Array of DatumMessage with actual column values for INSERT/UPDATE
+- old_tuple: Array of DatumMessage with old values for UPDATE/DELETE
+- transaction_id, commit_time: Transaction metadata
+
+Each DatumMessage has:
+
+- column_name: "id", "name", "email", etc.
+- column_type: PostgreSQL type OID
+- datum: Union of typed values (int32, int64, float, double, bool, string, bytes, point)
 
 ## Notes
 

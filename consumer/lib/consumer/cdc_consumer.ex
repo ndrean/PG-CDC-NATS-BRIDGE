@@ -40,14 +40,22 @@ defmodule Consumer.CdcConsumer do
 
       cond do
         is_list(decoded) ->
-          # Batch of events - each event has table, operation, subject, msg_id
+          # Batch of events - each event has table, operation, subject, msg_id, and data
           Enum.each(decoded, fn event ->
-            Logger.info("[CDC Consumer] Batch event - table: #{event["table"]}, operation: #{event["operation"]}, msg_id: #{event["msg_id"]}")
+            data_str = if event["data"], do: " data=#{inspect(event["data"])}", else: ""
+
+            Logger.info(
+              "[CDC Consumer] Batch event - table: #{event["table"]}, operation: #{event["operation"]}, msg_id: #{event["msg_id"]}#{data_str}"
+            )
           end)
 
         true ->
-          # Single event with table and operation fields
-          Logger.info("[CDC Consumer] #{message.topic}: table=#{decoded["table"]}, operation=#{decoded["operation"]}")
+          # Single event with table, operation, and data fields
+          data_str = if decoded["data"], do: " data=#{inspect(decoded["data"])}", else: ""
+
+          Logger.info(
+            "[CDC Consumer] #{message.topic}: table=#{decoded["table"]}, operation=#{decoded["operation"]}#{data_str}"
+          )
       end
 
       # Acknowledge successful processing

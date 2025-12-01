@@ -10,7 +10,11 @@ iex> Producer.run_test(20, "table name")
 
 ## Optimisations
 
-Currently, 30 kEvt/s sustained, peeks to 50 kEvt/s as long as CPU stays low. For example, a mass INSERT of 100 requests per ms.
+Parse WAL -> Decode tuple -> build event -> add to batch -> flush conditions and msgpck encode
+
+Currently, 30 kEvt/s sustained with WAL lag <1MB (33µs pg to nats), peeks to 45-50 kEvt/s as long as CPU stays low and memory low (20MB).
+
+Test: a bulk 150 INSERT requests per ms.
 
 - Tune PostgreSQL
 

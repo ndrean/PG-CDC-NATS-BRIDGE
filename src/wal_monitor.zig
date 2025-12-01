@@ -1,18 +1,67 @@
+//! WAL monitoring functionality.
+//!
+//! Includes getting current WAL LSN and monitoring WAL lag in a background thread.
 const std = @import("std");
 const c = @cImport({
     @cInclude("libpq-fe.h");
 });
-const pg_setup = @import("pg_setup.zig");
+const pg_conn = @import("pg_conn.zig");
 const metrics_mod = @import("metrics.zig");
 
 pub const log = std.log.scoped(.wal_monitor);
 
 /// Configuration for WAL monitoring
 pub const Config = struct {
-    pg_config: *const pg_setup.PgSetup,
+    pg_config: *const pg_conn.PgConf,
     slot_name: []const u8,
     check_interval_seconds: u32 = 30,
 };
+
+/// Get current WAL LSN position
+///
+/// Caller is responsible for freeing the returned LSN string
+pub fn getCurrentLSN(allocator: std.mem.Allocator, pg_conf: *const pg_conn.PgConf) ![]const u8 {
+    const conninfo = try pg_conf.connInfo(allocator, false);
+    defer allocator.free(conninfo);
+
+    const conn = c.PQconnectdb(conninfo.ptr) orelse {
+        log.err("🔴 Connection failed: PQconnectdb returned null", .{});
+        return error.ConnectionFailed;
+    };
+
+    if (c.PQstatus(conn) != c.CONNECTION_OK) {
+        const err_msg = c.PQerrorMessage(conn);
+        log.err("🔴 Connection failed: {s}", .{err_msg});
+        c.PQfinish(conn);
+        return error.ConnectionFailed;
+    }
+
+    defer c.PQfinish(conn);
+
+    const query = "SELECT pg_current_wal_lsn()::text";
+
+    const result = c.PQexec(conn, query.ptr) orelse {
+        log.err("🔴 Query execution failed: PQexec returned null", .{});
+        return error.QueryFailed;
+    };
+
+    if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK and c.PQresultStatus(result) != c.PGRES_COMMAND_OK) {
+        const err_msg = c.PQerrorMessage(conn);
+        log.err("🔴 Query failed: {s}", .{err_msg});
+        c.PQclear(result);
+        return error.QueryFailed;
+    }
+    defer c.PQclear(result);
+
+    if (c.PQntuples(result) == 0) {
+        return error.NoLSNReturned;
+    }
+
+    const lsn_cstr = c.PQgetvalue(result, 0, 0);
+    // potential error if lsn_cstr is null, but PQgetvalue should not return null if there is at least one tuple, the check above
+    const lsn = std.mem.span(lsn_cstr);
+    return try allocator.dupe(u8, lsn);
+}
 
 /// Background thread that periodically checks WAL lag
 pub fn monitorWalLag(
@@ -21,12 +70,12 @@ pub fn monitorWalLag(
     should_stop: *std.atomic.Value(bool),
     allocator: std.mem.Allocator,
 ) !void {
-    log.info(" WAL lag monitor started (checking every {d}s)\n", .{config.check_interval_seconds});
+    log.info("ℹ️ WAL lag monitor started (checking every {d}s)\n", .{config.check_interval_seconds});
 
     while (!should_stop.load(.seq_cst)) {
         // Check WAL lag
         checkWalLag(metrics, config, allocator) catch |err| {
-            log.warn("Failed to check WAL lag: {}", .{err});
+            log.warn("⚠️ Failed to check WAL lag: {}", .{err});
         };
 
         // Sleep for check interval
@@ -37,7 +86,7 @@ pub fn monitorWalLag(
         }
     }
 
-    log.info("WAL lag monitor stopped\n", .{});
+    log.info("🥁 WAL lag monitor stopped\n", .{});
 }
 
 fn checkWalLag(
@@ -54,7 +103,7 @@ fn checkWalLag(
     defer c.PQfinish(conn);
 
     if (c.PQstatus(conn) != c.CONNECTION_OK) {
-        log.warn("WAL monitor connection failed: {s}", .{c.PQerrorMessage(conn)});
+        log.warn("⚠️ WAL monitor connection failed: {s}", .{c.PQerrorMessage(conn)});
         return error.ConnectionFailed;
     }
 
@@ -77,13 +126,13 @@ fn checkWalLag(
     defer c.PQclear(result);
 
     if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
-        log.warn("WAL lag query failed: {s}", .{c.PQerrorMessage(conn)});
+        log.warn("🔴 WAL lag query failed: {s}", .{c.PQerrorMessage(conn)});
         return error.QueryFailed;
     }
 
     const nrows = c.PQntuples(result);
     if (nrows == 0) {
-        log.warn("Replication slot '{s}' not found", .{config.slot_name});
+        log.warn("🔴 Replication slot '{s}' not found", .{config.slot_name});
         metrics.updateWalLag(false, 0);
         return;
     }
@@ -114,7 +163,7 @@ fn checkWalLag(
             lag_bytes / (1024 * 1024),
         });
     } else {
-        log.debug("WAL lag: {d} MB (slot active: {s})", .{
+        log.debug("ℹ️ WAL lag: {d} MB (slot active: {s})", .{
             lag_bytes / (1024 * 1024),
             if (slot_active) "yes" else "no",
         });

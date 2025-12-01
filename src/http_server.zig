@@ -35,8 +35,8 @@ pub const Server = struct {
         });
         defer server.deinit();
 
-        log.info("HTTP server listening on http://0.0.0.0:{d}", .{self.address.getPort()});
-        log.info("Available endpoints:", .{});
+        log.info("✅ HTTP server listening on http://0.0.0.0:{d}", .{self.address.getPort()});
+        log.info("ℹ️ Available endpoints:", .{});
         log.info("  GET  /health         - Health check", .{});
         log.info("  GET  /status         - Bridge status (JSON)", .{});
         log.info("  GET  /metrics        - Prometheus metrics", .{});
@@ -58,7 +58,7 @@ pub const Server = struct {
 
             // Poll with 100ms timeout
             const ready = std.posix.poll(&poll_fds, 100) catch |err| {
-                log.err("Poll error: {}", .{err});
+                log.err("⚠️ Poll error: {}", .{err});
                 std.Thread.sleep(100 * std.time.ns_per_ms);
                 continue;
             };
@@ -68,20 +68,18 @@ pub const Server = struct {
                 continue;
             }
 
-            // Accept connection
             const conn = server.accept() catch |err| {
-                log.err("Failed to accept connection: {}", .{err});
+                log.err("🔴 Failed to accept connection: {}", .{err});
                 continue;
             };
             defer conn.stream.close();
 
-            // Handle request
             self.handleRequest(conn.stream) catch |err| {
-                log.warn("Error handling request: {}", .{err});
+                log.warn("⚠️ Error handling request: {}", .{err});
             };
         }
 
-        log.info("HTTP server stopped", .{});
+        log.info("👋 HTTP server stopped", .{});
     }
 
     fn handleRequest(self: *Server, stream: std.net.Stream) !void {
@@ -253,7 +251,7 @@ pub const Server = struct {
     }
 
     fn handleShutdown(self: *Server, stream: std.net.Stream) !void {
-        log.info("Shutdown requested via HTTP", .{});
+        log.info("👋 Shutdown requested via HTTP", .{});
 
         // Set shutdown flag
         self.should_stop.store(true, .seq_cst);
@@ -287,7 +285,7 @@ pub const Server = struct {
 
     fn handleStreamInfo(self: *Server, stream: std.net.Stream, path: []const u8) !void {
         const stream_name = parseQueryParam(path, "stream") orelse {
-            try sendResponse(stream, "400 Bad Request", "text/plain", "Missing 'stream' parameter\n");
+            try sendResponse(stream, "400 Bad Request", "text/plain", "⚠️ Missing 'stream' parameter\n");
             return;
         };
 
@@ -303,13 +301,13 @@ pub const Server = struct {
 
             try sendResponse(stream, "200 OK", "application/json", info);
         } else {
-            try sendResponse(stream, "503 Service Unavailable", "text/plain", "NATS publisher not available\n");
+            try sendResponse(stream, "503 Service Unavailable", "text/plain", "⚠️ NATS publisher not available\n");
         }
     }
 
     fn handleStreamCreate(self: *Server, stream: std.net.Stream, path: []const u8) !void {
         const stream_name = parseQueryParam(path, "stream") orelse {
-            try sendResponse(stream, "400 Bad Request", "text/plain", "Missing 'stream' parameter\n");
+            try sendResponse(stream, "400 Bad Request", "text/plain", "⚠️ Missing 'stream' parameter\n");
             return;
         };
 
@@ -341,7 +339,7 @@ pub const Server = struct {
             const response = try std.fmt.bufPrint(&response_buf, "Stream '{s}' created with subjects: {s}\n", .{ stream_name, subjects });
             try sendResponse(stream, "200 OK", "text/plain", response);
         } else {
-            try sendResponse(stream, "503 Service Unavailable", "text/plain", "NATS publisher not available\n");
+            try sendResponse(stream, "503 Service Unavailable", "text/plain", "⚠️ NATS publisher not available\n");
         }
     }
 
@@ -354,7 +352,7 @@ pub const Server = struct {
         if (self.nats_publisher) |publisher| {
             publisher.deleteStream(stream_name) catch |err| {
                 var err_buf: [256]u8 = undefined;
-                const err_msg = try std.fmt.bufPrint(&err_buf, "Failed to delete stream: {}\n", .{err});
+                const err_msg = try std.fmt.bufPrint(&err_buf, "⚠️ Failed to delete stream: {}\n", .{err});
                 try sendResponse(stream, "500 Internal Server Error", "text/plain", err_msg);
                 return;
             };
@@ -363,20 +361,20 @@ pub const Server = struct {
             const response = try std.fmt.bufPrint(&response_buf, "Stream '{s}' deleted\n", .{stream_name});
             try sendResponse(stream, "200 OK", "text/plain", response);
         } else {
-            try sendResponse(stream, "503 Service Unavailable", "text/plain", "NATS publisher not available\n");
+            try sendResponse(stream, "503 Service Unavailable", "text/plain", "⚠️ NATS publisher not available\n");
         }
     }
 
     fn handleStreamPurge(self: *Server, stream: std.net.Stream, path: []const u8) !void {
         const stream_name = parseQueryParam(path, "stream") orelse {
-            try sendResponse(stream, "400 Bad Request", "text/plain", "Missing 'stream' parameter\n");
+            try sendResponse(stream, "400 Bad Request", "text/plain", "⚠️ Missing 'stream' parameter\n");
             return;
         };
 
         if (self.nats_publisher) |publisher| {
             publisher.purgeStream(stream_name) catch |err| {
                 var err_buf: [256]u8 = undefined;
-                const err_msg = try std.fmt.bufPrint(&err_buf, "Failed to purge stream: {}\n", .{err});
+                const err_msg = try std.fmt.bufPrint(&err_buf, "⚠️ Failed to purge stream: {}\n", .{err});
                 try sendResponse(stream, "500 Internal Server Error", "text/plain", err_msg);
                 return;
             };
@@ -385,7 +383,7 @@ pub const Server = struct {
             const response = try std.fmt.bufPrint(&response_buf, "Stream '{s}' purged\n", .{stream_name});
             try sendResponse(stream, "200 OK", "text/plain", response);
         } else {
-            try sendResponse(stream, "503 Service Unavailable", "text/plain", "NATS publisher not available\n");
+            try sendResponse(stream, "503 Service Unavailable", "text/plain", "⚠️ NATS publisher not available\n");
         }
     }
 };

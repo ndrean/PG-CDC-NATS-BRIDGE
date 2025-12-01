@@ -1,5 +1,6 @@
+//! Replication setup tasks, including creating/dropping replication slots and publications,
 const std = @import("std");
-const pg_setup = @import("pg_setup.zig");
+const pg_conn = @import("pg_conn.zig");
 
 pub const log = std.log.scoped(.replication_setup);
 
@@ -7,16 +8,18 @@ const c = @cImport({
     @cInclude("libpq-fe.h");
 });
 
+/// Struct to handle replication setup tasks and includes get current WAL LSN.
+///
+/// Includes creating|droping replication slots and publications.
 pub const ReplicationSetup = struct {
     allocator: std.mem.Allocator,
-    pg_config: *const pg_setup.PgSetup,
+    pg_config: pg_conn.PgConf,
 
     /// Create a replication slot if it doesn't exist
-    pub fn createSlot(self: *const ReplicationSetup, slot_name: []const u8) !void {
-        log.info("Creating replication slot '{s}'...", .{slot_name});
-
-        const conn = try self.connect();
-        defer c.PQfinish(conn);
+    pub fn createSlot(
+        self: *const ReplicationSetup,
+        slot_name: []const u8,
+    ) !void {
 
         // Check if slot exists
         const check_query = try std.fmt.allocPrintSentinel(
@@ -27,19 +30,16 @@ pub const ReplicationSetup = struct {
         );
         defer self.allocator.free(check_query);
 
-        const check_result = c.PQexec(conn, check_query.ptr);
-        defer c.PQclear(check_result);
+        const conn = try self.connect();
+        defer c.PQfinish(conn);
 
-        if (c.PQresultStatus(check_result) != c.PGRES_TUPLES_OK) {
-            const err_msg = c.PQerrorMessage(conn);
-            log.err("Failed to check slot existence: {s}", .{err_msg});
-            return error.SlotCheckFailed;
-        }
+        const check_result = try runQuery(conn, check_query);
+        defer c.PQclear(check_result);
 
         const exists = c.PQntuples(check_result) > 0;
 
         if (exists) {
-            log.info("Replication slot '{s}' already exists", .{slot_name});
+            log.info("✅ Replication slot '{s}' already exists", .{slot_name});
             return;
         }
 
@@ -52,22 +52,19 @@ pub const ReplicationSetup = struct {
         );
         defer self.allocator.free(create_query);
 
-        const create_result = c.PQexec(conn, create_query.ptr);
+        const create_result = try runQuery(conn, create_query);
         defer c.PQclear(create_result);
 
-        if (c.PQresultStatus(create_result) != c.PGRES_TUPLES_OK) {
-            const err_msg = c.PQerrorMessage(conn);
-            log.err("Failed to create replication slot: {s}", .{err_msg});
-            return error.SlotCreationFailed;
-        }
-
-        log.info("✓ Replication slot '{s}' created", .{slot_name});
+        log.info("✅ Replication slot '{s}' created", .{slot_name});
     }
 
-    /// Create a publication if it doesn't exist
-    pub fn createPublication(self: *const ReplicationSetup, pub_name: []const u8, tables: []const []const u8) !void {
-        log.info("Creating publication '{s}'...", .{pub_name});
-
+    /// Create a publication if it doesn't exist on given tables.
+    /// ALL TABLES if tables is empty or list of table names.
+    pub fn createPublication(
+        self: *const ReplicationSetup,
+        pub_name: []const u8,
+        tables: []const []const u8,
+    ) !void {
         const conn = try self.connect();
         defer c.PQfinish(conn);
 
@@ -80,19 +77,19 @@ pub const ReplicationSetup = struct {
         );
         defer self.allocator.free(check_query);
 
-        const check_result = c.PQexec(conn, check_query.ptr);
+        const check_result = try runQuery(conn, check_query);
         defer c.PQclear(check_result);
-
-        if (c.PQresultStatus(check_result) != c.PGRES_TUPLES_OK) {
-            const err_msg = c.PQerrorMessage(conn);
-            log.err("Failed to check publication existence: {s}", .{err_msg});
-            return error.PublicationCheckFailed;
-        }
 
         const exists = c.PQntuples(check_result) > 0;
 
         if (exists) {
-            log.info("Publication '{s}' already exists", .{pub_name});
+            if (tables.len == 0) {
+                log.info("✅  Publication '{s}' already exists, listening on ALL TABLES", .{pub_name});
+            } else {
+                const table_list = try std.mem.join(self.allocator, ", ", tables);
+                defer self.allocator.free(table_list);
+                log.info("✅ Publication '{s}' already exists, listening on tables: {s}", .{ pub_name, table_list });
+            }
             return;
         }
 
@@ -120,34 +117,16 @@ pub const ReplicationSetup = struct {
         };
         defer self.allocator.free(create_query);
 
-        const create_result = c.PQexec(conn, create_query.ptr);
+        const create_result = try runQuery(conn, create_query);
         defer c.PQclear(create_result);
 
-        if (c.PQresultStatus(create_result) != c.PGRES_COMMAND_OK) {
-            const err_msg = c.PQerrorMessage(conn);
-            log.err("Failed to create publication: {s}", .{err_msg});
-            return error.PublicationCreationFailed;
+        if (tables.len == 0) {
+            log.info("✅ Publication '{s}' created for ALL TABLES", .{pub_name});
+        } else {
+            const table_list = try std.mem.join(self.allocator, ", ", tables);
+            defer self.allocator.free(table_list);
+            log.info("✅ Publication '{s}' created for tables: {s}", .{ pub_name, table_list });
         }
-
-        log.info("✓ Publication '{s}' created", .{pub_name});
-    }
-
-    /// Get current WAL LSN
-    ///
-    /// Caller is responsible for freeing the returned LSN string
-    pub fn getCurrentLSN(self: *const ReplicationSetup) ![]const u8 {
-        const query = "SELECT pg_current_wal_lsn()::text";
-        const result = try self.runQuery(query);
-        defer c.PQclear(result);
-
-        if (c.PQntuples(result) == 0) {
-            return error.NoLSNReturned;
-        }
-
-        const lsn_cstr = c.PQgetvalue(result, 0, 0);
-        // potential error if lsn_cstr is null, but PQgetvalue should not return null if there is at least one tuple, the check above
-        const lsn = std.mem.span(lsn_cstr);
-        return try self.allocator.dupe(u8, lsn);
     }
 
     /// Drop a replication slot
@@ -162,7 +141,10 @@ pub const ReplicationSetup = struct {
         );
         defer self.allocator.free(query);
 
-        const result = try self.runQuery(query);
+        const conn = try self.connect();
+        defer c.PQfinish(conn);
+
+        const result = try runQuery(conn, query);
         defer c.PQclear(result);
 
         log.info("✓ Replication slot '{s}' dropped", .{slot_name});
@@ -180,36 +162,16 @@ pub const ReplicationSetup = struct {
         );
         defer self.allocator.free(query);
 
-        const result = try self.runQuery(query);
+        const conn = try self.connect();
+        defer c.PQfinish(conn);
+
+        const result = try runQuery(conn, query);
         defer c.PQclear(result);
 
         log.info("✓ Publication '{s}' dropped", .{pub_name});
     }
 
-    // Private helper to connect
-    fn connect(self: *const ReplicationSetup) !*c.PGconn {
-        const conninfo = try self.pg_config.connInfo(self.allocator, false);
-        defer self.allocator.free(conninfo);
-
-        const conn = c.PQconnectdb(conninfo.ptr) orelse {
-            log.err("Connection failed: PQconnectdb returned null", .{});
-            return error.ConnectionFailed;
-        };
-
-        if (c.PQstatus(conn) != c.CONNECTION_OK) {
-            const err_msg = c.PQerrorMessage(conn);
-            log.err("Connection failed: {s}", .{err_msg});
-            c.PQfinish(conn);
-            return error.ConnectionFailed;
-        }
-
-        return conn;
-    }
-
-    fn runQuery(self: *const ReplicationSetup, query: []const u8) !*c.PGresult {
-        const conn = try self.connect();
-        defer c.PQfinish(conn);
-
+    fn runQuery(conn: *c.PGconn, query: []const u8) !*c.PGresult {
         const result = c.PQexec(conn, query.ptr) orelse {
             log.err("Query execution failed: PQexec returned null", .{});
             return error.QueryFailed;
@@ -223,5 +185,33 @@ pub const ReplicationSetup = struct {
         }
 
         return result;
+    }
+
+    pub fn connect(self: *const ReplicationSetup) !*c.PGconn {
+        // Build connection string
+        const conninfo = try self.pg_config.connInfo(
+            self.allocator,
+            self.pg_config.replication,
+        );
+        defer self.allocator.free(conninfo);
+
+        if (conninfo.len == 0) {
+            log.err("Invalid configuration: connection string is empty", .{});
+            return error.InvalidConfig;
+        }
+
+        const conn = c.PQconnectdb(conninfo.ptr) orelse {
+            log.err("🔴 Connection failed: PQconnectdb returned null", .{});
+            return error.ConnectionFailed;
+        };
+
+        if (c.PQstatus(conn) != c.CONNECTION_OK) {
+            const err_msg = c.PQerrorMessage(conn);
+            log.err("🔴 Connection failed: {s}", .{err_msg});
+            c.PQfinish(conn);
+            return error.ConnectionFailed;
+        }
+
+        return conn;
     }
 };

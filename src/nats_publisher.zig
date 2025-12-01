@@ -80,7 +80,7 @@ pub const Publisher = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: PublisherConfig) !Publisher {
         const nats_uri = std.process.getEnvVarOwned(allocator, "NATS_HOST") catch |err| blk: {
-            log.info("NATS_HOST env var not set ({}), using default 127.0.0.1", .{err});
+            log.info("NATS_HOST env var not set ({t}), using default 127.0.0.1", .{err});
             break :blk try allocator.dupe(u8, "127.0.0.1");
         };
         defer allocator.free(nats_uri);
@@ -108,7 +108,7 @@ pub const Publisher = struct {
         // Create options
         status = c.natsOptions_Create(&opts);
         if (status != c.NATS_OK) {
-            log.err("Failed to create NATS options: {s}", .{c.natsStatus_GetText(status)});
+            log.err("🔴 Failed to create NATS options: {s}", .{c.natsStatus_GetText(status)});
             return error.NatsOptionsCreateFailed;
         }
         defer c.natsOptions_Destroy(opts);
@@ -116,29 +116,28 @@ pub const Publisher = struct {
         // Set server URL
         status = c.natsOptions_SetURL(opts, self.nats_host.ptr);
         if (status != c.NATS_OK) {
-            log.err("Failed to set NATS URL: {s}", .{c.natsStatus_GetText(status)});
+            log.err("🔴 Failed to set NATS URL: {s}", .{c.natsStatus_GetText(status)});
             return error.NatsSetURLFailed;
         }
 
         // Connect to NATS
-        log.info("Connecting to NATS at {s} ...", .{self.nats_host});
         status = c.natsConnection_Connect(&self.nc, opts);
         if (status != c.NATS_OK) {
-            log.err("Failed to connect to NATS: {s}", .{c.natsStatus_GetText(status)});
+            log.err("🔴 Failed to connect to NATS: {s}", .{c.natsStatus_GetText(status)});
             return error.NatsConnectionFailed;
         }
 
-        log.info("✓ Connected to NATS", .{});
+        log.info("🟢 Connected to NATS at {s}", .{self.nats_host});
 
         // Get JetStream context
         status = c.natsConnection_JetStream(&self.js, self.nc, null);
         if (status != c.NATS_OK) {
-            log.err("Failed to get JetStream context: {s}", .{c.natsStatus_GetText(status)});
+            log.err("🔴 Failed to get JetStream context: {s}", .{c.natsStatus_GetText(status)});
             self.deinit();
             return error.JetStreamContextFailed;
         }
 
-        log.info("✓ JetStream context acquired", .{});
+        log.info("✅ JetStream context acquired", .{});
     }
 
     pub fn deinit(self: *Publisher) void {
@@ -156,7 +155,7 @@ pub const Publisher = struct {
         }
         self.nats_host = "";
 
-        log.info("Disconnected from NATS", .{});
+        log.info("🥁 Disconnected from NATS", .{});
     }
 
     /// Publish a message to JetStream asynchronously with optional message ID for deduplication
@@ -185,7 +184,7 @@ pub const Publisher = struct {
             // Initialize options
             const init_status = c.jsPubOptions_Init(&opts_storage);
             if (init_status != c.NATS_OK) {
-                log.err("Failed to initialize jsPubOptions: {d}", .{init_status});
+                log.err("🔴 Failed to initialize jsPubOptions: {d}", .{init_status});
                 return error.InitFailed;
             }
 
@@ -206,7 +205,7 @@ pub const Publisher = struct {
         );
 
         if (status != c.NATS_OK) {
-            log.err("Failed to publish async: {s}", .{c.natsStatus_GetText(status)});
+            log.err("🔴 Failed to publish async: {s}", .{c.natsStatus_GetText(status)});
             return error.PublishFailed;
         }
     }
@@ -222,7 +221,7 @@ pub const Publisher = struct {
 
         const status = c.js_PublishAsyncComplete(self.js, null);
         if (status != c.NATS_OK) {
-            log.warn("Async publish completion had errors: {s}", .{c.natsStatus_GetText(status)});
+            log.warn("🔴 Async publish completion had errors: {s}", .{c.natsStatus_GetText(status)});
             // Don't return error - some publishes may have succeeded
         }
     }
@@ -277,11 +276,11 @@ pub const Publisher = struct {
         const status = c.js_DeleteStream(self.js, stream_name_z.ptr, null, &js_err);
 
         if (status != c.NATS_OK) {
-            log.err("Failed to delete stream: {s}", .{c.natsStatus_GetText(status)});
+            log.err("🔴 Failed to delete stream: {s}", .{c.natsStatus_GetText(status)});
             return error.DeleteStreamFailed;
         }
 
-        log.info("Stream '{s}' deleted", .{stream_name});
+        log.info("☑️ Stream '{s}' deleted", .{stream_name});
     }
 
     /// Purge all messages from a stream
@@ -297,11 +296,11 @@ pub const Publisher = struct {
         const status = c.js_PurgeStream(self.js, stream_name_z.ptr, null, &js_err);
 
         if (status != c.NATS_OK) {
-            log.err("Failed to purge stream: {s}", .{c.natsStatus_GetText(status)});
+            log.err("🔴 Failed to purge stream: {s}", .{c.natsStatus_GetText(status)});
             return error.PurgeStreamFailed;
         }
 
-        log.info("Stream '{s}' purged", .{stream_name});
+        log.info("☑️ Stream '{s}' purged", .{stream_name});
     }
 };
 

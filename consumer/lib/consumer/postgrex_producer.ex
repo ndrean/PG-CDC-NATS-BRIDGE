@@ -113,7 +113,8 @@ defmodule PgProducer do
       CREATE TABLE IF NOT EXISTS #{name} (
         id SERIAL PRIMARY KEY,
         name TEXT NOT NULL,
-        email TEXT
+        email TEXT,
+        create_at TIMESTAMPTZ DEFAULT now()
       );
       """)
 

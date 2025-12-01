@@ -40,7 +40,8 @@ defmodule Consumer.MixProject do
       {:msgpax, "~> 2.4"},
       {:postgrex, "~> 0.21.1"},
       {:ecto_sql, "~> 3.13"},
-      {:req, "~> 0.5"}
+      {:req, "~> 0.5"},
+      {:protobuf, "~> 0.15.0"}
     ]
   end
 

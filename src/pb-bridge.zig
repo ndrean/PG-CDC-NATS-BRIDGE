@@ -1,8 +1,8 @@
-//! Bridge application that streams PostgreSQL CDC events to NATS JetStream using pgoutput format
+//! Bridge application that streams PostgreSQL CDC events to NATS JetStream using decoderbufs format
 const std = @import("std");
 const posix = std.posix;
-const wal_stream = @import("wal_stream.zig");
-const pgoutput = @import("pgoutput.zig");
+const wal_stream = @import("wal_stream_decoderbufs.zig");
+const decoderbufs_parser = @import("decoderbufs_parser.zig");
 const nats_publisher = @import("nats_publisher.zig");
 const batch_publisher = @import("batch_publisher.zig");
 const replication_setup = @import("replication_setup.zig");
@@ -11,80 +11,95 @@ const http_server = @import("http_server.zig");
 const metrics_mod = @import("metrics.zig");
 const wal_monitor = @import("wal_monitor.zig");
 const pg_conn = @import("pg_conn.zig");
-const args = @import("args.zig");
 
 pub const log = std.log.scoped(.bridge);
 
 // Global flag for graceful shutdown (shared with HTTP server)
 var should_stop = std.atomic.Value(bool).init(false);
 
-/// Helper to process and publish a CDC event (INSERT/UPDATE/DELETE)
-fn processCdcEvent(
-    arena_allocator: std.mem.Allocator,
-    rel: pgoutput.RelationMessage,
-    tuple_data: pgoutput.TupleData,
-    operation: []const u8,
-    subject_prefix: []const u8,
-    wal_end: u64,
-    batch_pub: *batch_publisher.BatchPublisher,
-    metrics: *metrics_mod.Metrics,
-) !void {
-    // Decode tuple data to get actual column values
-    var decoded_values = pgoutput.decodeTuple(
-        arena_allocator,
-        tuple_data,
-        rel.columns,
-    ) catch |err| {
-        log.warn("Failed to decode tuple: {}", .{err});
-        return;
-    };
-    defer decoded_values.deinit();
-
-    // Extract ID value for logging (if present)
-    const id_str = if (decoded_values.get("id")) |id_value| blk: {
-        break :blk switch (id_value) {
-            .int32 => |v| try std.fmt.allocPrint(arena_allocator, "{d}", .{v}),
-            .int64 => |v| try std.fmt.allocPrint(arena_allocator, "{d}", .{v}),
-            .text => |v| try std.fmt.allocPrint(arena_allocator, "{s}", .{v}),
-            else => "?",
-        };
-    } else null;
-
-    // Convert operation to lowercase for NATS subject
-    const operation_lower = try std.ascii.allocLowerString(arena_allocator, operation);
-
-    // Create NATS subject
-    const subject = try std.fmt.allocPrintSentinel(
-        arena_allocator,
-        "{s}.{s}.{s}",
-        .{ subject_prefix, rel.name, operation_lower },
-        0,
-    );
-
-    // Generate message ID from WAL LSN for idempotent delivery
-    const msg_id = try std.fmt.allocPrint(
-        arena_allocator,
-        "{x}-{s}-{s}",
-        .{ wal_end, rel.name, operation_lower },
-    );
-
-    // Add to batch publisher with column data
-    try batch_pub.addEvent(subject, rel.name, operation, msg_id, decoded_values);
-    metrics.incrementCdcEvents();
-
-    // Log single line with table, operation, and ID
-    if (id_str) |id| {
-        log.info("{s} {s}.{s} id={s} → {s}", .{ operation, rel.namespace, rel.name, id, subject });
-    } else {
-        log.info("{s} {s}.{s} → {s}", .{ operation, rel.namespace, rel.name, subject });
-    }
-}
-
 // Signal handler for graceful shutdown
 fn handleShutdown(sig: c_int) callconv(.c) void {
     _ = sig;
     should_stop.store(true, .seq_cst);
 }
+
+const Args = struct {
+    stream_name: []const u8,
+    http_port: u16,
+    slot_name: []const u8,
+    publication_name: []const u8,
+    tables: []const []const u8, // Empty slice = all tables
+
+    pub fn parseArgs(allocator: std.mem.Allocator) !Args {
+        // Parse command-line arguments
+        var args = try std.process.argsWithAllocator(allocator);
+        _ = args.skip(); // Skip program name
+        var stream_name: []const u8 = "CDC_BRIDGE"; // default
+        var http_port: u16 = 8080; // default
+        var slot_name: []const u8 = "bridge_slot"; // default
+        var publication_name: []const u8 = "bridge_pub"; // default
+        var tables: []const []const u8 = &.{}; // default: all tables
+
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--stream")) {
+                if (args.next()) |value| {
+                    stream_name = value;
+                }
+            } else if (std.mem.eql(u8, arg, "--port")) {
+                if (args.next()) |value| {
+                    http_port = std.fmt.parseInt(u16, value, 10) catch {
+                        log.err("--port requires a valid port number (1-65535)", .{});
+                        return error.InvalidArguments;
+                    };
+                }
+            } else if (std.mem.eql(u8, arg, "--slot")) {
+                if (args.next()) |value| {
+                    slot_name = value;
+                }
+            } else if (std.mem.eql(u8, arg, "--publication")) {
+                if (args.next()) |value| {
+                    publication_name = value;
+                }
+            } else if (std.mem.eql(u8, arg, "--table")) {
+                if (args.next()) |value| {
+                    // Check if "all" (case-insensitive)
+                    if (std.ascii.eqlIgnoreCase(value, "all")) {
+                        tables = &.{}; // Empty = all tables
+                    } else {
+                        // Parse comma-separated table names
+                        var table_list = std.ArrayList([]const u8){};
+                        defer table_list.deinit(allocator);
+
+                        var iter = std.mem.splitScalar(u8, value, ',');
+                        while (iter.next()) |table_name| {
+                            const trimmed = std.mem.trim(
+                                u8,
+                                table_name,
+                                &std.ascii.whitespace,
+                            );
+
+                            if (trimmed.len > 0) {
+                                // Heap-allocate the string to ensure it outlives parseArgs()
+                                const owned = try allocator.dupe(u8, trimmed);
+                                try table_list.append(allocator, owned);
+                            }
+                        }
+
+                        tables = try table_list.toOwnedSlice(allocator);
+                    }
+                }
+            }
+        }
+
+        return Args{
+            .stream_name = stream_name,
+            .http_port = http_port,
+            .slot_name = slot_name,
+            .publication_name = publication_name,
+            .tables = tables,
+        };
+    }
+};
 
 pub fn main() !void {
     const IS_DEBUG = @import("builtin").mode == .Debug;
@@ -96,7 +111,7 @@ pub fn main() !void {
         _ = gpa.detectLeaks();
     };
 
-    const parsed_args = try args.Args.parseArgs(allocator);
+    const parsed_args = try Args.parseArgs(allocator);
     defer {
         for (parsed_args.tables) |table| {
             allocator.free(table);
@@ -104,18 +119,18 @@ pub fn main() !void {
         allocator.free(parsed_args.tables);
     }
 
-    log.info("▶️ Starting CDC Bridge with parameters:\n", .{});
-    log.info("Publication name: \x1b[1m {s} \x1b[0m", .{parsed_args.publication_name});
-    log.info("Slot name: \x1b[1m {s} \x1b[0m", .{parsed_args.slot_name});
-    log.info("Stream name: \x1b[1m {s} \x1b[0m", .{parsed_args.stream_name});
-    log.info("HTTP port: \x1b[1m {d} \x1b[0m", .{parsed_args.http_port});
+    log.info("Starting CDC Bridge with parameters:\n", .{});
+    log.info("Publication name: {s}", .{parsed_args.publication_name});
+    log.info("Slot name: {s}", .{parsed_args.slot_name});
+    log.info("Stream name: {s}", .{parsed_args.stream_name});
+    log.info("HTTP port: {d}", .{parsed_args.http_port});
 
     if (parsed_args.tables.len == 0) {
-        log.info("Tables: \x1b[1m ALL\x1b[0m", .{});
+        log.info("Tables: ALL", .{});
     } else {
         const parsed_tables = try std.mem.join(allocator, ", ", parsed_args.tables);
         defer allocator.free(parsed_tables);
-        log.info("Tables: \x1b[1m {s} \x1b[0m", .{parsed_tables});
+        log.info("Tables: {s}", .{parsed_tables});
     }
 
     // Register signal handlers for graceful shutdown
@@ -127,7 +142,7 @@ pub fn main() !void {
     };
     posix.sigaction(posix.SIG.INT, &sigaction, null); // Ctrl+C
     posix.sigaction(posix.SIG.TERM, &sigaction, null); // kill command
-    log.info("👋 Press \x1b[1m Ctrl+C \x1b[0m to stop gracefully\n", .{});
+    log.info("Press Ctrl+C to stop gracefully\n", .{});
 
     // Initialize metrics
     var metrics = metrics_mod.Metrics.init();
@@ -147,11 +162,20 @@ pub fn main() !void {
     );
     defer http_thread.join();
 
+    // 1. Create replication slot and publication using libpq
+    log.info("1. Setting up replication infrastructure...", .{});
+
     // PostgreSQL connection configuration
+    const pg_host = std.process.getEnvVarOwned(allocator, "POSTGRES_HOST") catch |err| blk: {
+        log.info("POSTGRES_HOST env var not set ({}), using default 127.0.0.1", .{err});
+        break :blk try allocator.dupe(u8, "127.0.0.1");
+    };
+    defer allocator.free(pg_host);
+
     var pg_config = try pg_conn.PgConf.init_from_env(allocator);
     defer pg_config.deinit(allocator);
 
-    const replication = replication_setup.ReplicationSetup{
+    const setup = replication_setup.ReplicationSetup{
         .allocator = allocator,
         .pg_config = pg_config,
     };
@@ -162,9 +186,9 @@ pub fn main() !void {
     const pub_name_z = try allocator.dupeZ(u8, parsed_args.publication_name);
     defer allocator.free(pub_name_z);
 
-    log.info("\nStarting PostgreSQL replication_slot and publication...", .{});
-    try replication.createSlot(slot_name_z);
-    try replication.createPublication(pub_name_z, parsed_args.tables);
+    try setup.createSlot(slot_name_z);
+    try setup.createPublication(pub_name_z, parsed_args.tables);
+    log.info(" ✓ Replication infrastructure ready\n", .{});
 
     // 2. Start WAL lag monitor in background thread
     const monitor_config = wal_monitor.Config{
@@ -180,7 +204,7 @@ pub fn main() !void {
     defer monitor_thread.join();
 
     // 3. Connect to NATS JetStream
-    log.info("\nConnecting to NATS JetStream...", .{});
+    log.info("2. Connecting to NATS JetStream...", .{});
     var publisher = try nats_publisher.Publisher.init(allocator, .{
         .url = "nats://localhost:4222",
     });
@@ -219,7 +243,7 @@ pub fn main() !void {
         allocator,
         stream_config,
     );
-    log.info("✅ NATS JetStream connected\n", .{});
+    log.info("✓ NATS JetStream connected\n", .{});
 
     // Make publisher available to HTTP server for stream management
     http_srv.nats_publisher = &publisher;
@@ -232,15 +256,15 @@ pub fn main() !void {
     };
     var batch_pub = batch_publisher.BatchPublisher.init(allocator, &publisher, batch_config);
     defer batch_pub.deinit();
-    log.info("✅ Batch publishing enabled (max {d} events or {d}ms or {d}KB)\n", .{ batch_config.max_events, batch_config.max_wait_ms, batch_config.max_payload_bytes / 1024 });
+    log.info("✓ Batch publishing enabled (max 100 events or 50ms or 64KB)\n", .{});
 
-    // Get current LSN to skip historical data
-    log.info(" \nGetting current LSN position...", .{});
+    // 4. Get current LSN to skip historical data
+    log.info(" 3. Getting current LSN position...", .{});
     const current_lsn = try wal_monitor.getCurrentLSN(allocator, &pg_config);
     defer allocator.free(current_lsn);
-    log.info("▶️ Current LSN: {s}\n", .{current_lsn});
+    log.info("Current LSN: {s}\n", .{current_lsn});
 
-    // Connect to replication stream starting from current LSN
+    // 5. Connect to replication stream starting from current LSN
     log.info(" 4. Connecting to WAL replication stream...", .{});
     var pg_stream = wal_stream.ReplicationStream.init(
         allocator,
@@ -254,14 +278,16 @@ pub fn main() !void {
 
     try pg_stream.connect();
     try pg_stream.startStreaming(current_lsn);
-    log.info(" ✅ WAL replication stream started from LSN {s}\n", .{current_lsn});
+    log.info(" ✓ WAL replication stream started from LSN {s}\n", .{current_lsn});
 
     // Mark as connected in metrics
     metrics.setConnected(true);
 
     // 5. Stream CDC events to NATS
-    // This bridge waits for PostgreSQL events generated by the producer
-    log.info("ℹ️ Subject pattern: \x1b[1m {s} \x1b[0m", .{lower_subject});
+    // This bridge waits for PostgreSQL events generated by the Elixir producer
+    // Run the Elixir producer to generate INSERT/UPDATE/DELETE events
+    log.info("5. Streaming events from PostgreSQL to NATS...\n", .{});
+    log.info("   Subject pattern: {s}\n", .{lower_subject});
 
     // Compute subject prefix (without the wildcard suffix)
     // Example: "cdc_bridge.>" -> "cdc_bridge"
@@ -274,7 +300,6 @@ pub fn main() !void {
 
     var msg_count: u32 = 0;
     var cdc_events: u32 = 0;
-    var last_lsn: u64 = 0;
     var last_ack_lsn: u64 = 0; // Track last acknowledged LSN for keepalives
     var last_keepalive_time = std.time.timestamp(); // Track last keepalive sent
     const keepalive_interval_seconds: i64 = 30; // Send keepalive every 30 seconds
@@ -294,16 +319,7 @@ pub fn main() !void {
     var last_metric_log_time = std.time.timestamp();
     const metric_log_interval_seconds: i64 = 15; // Log metrics every 15 seconds
 
-    // Track relation metadata (table info)
-    var relation_map = std.AutoHashMap(u32, pgoutput.RelationMessage).init(allocator);
-    defer {
-        var it = relation_map.valueIterator();
-        while (it.next()) |rel| {
-            var r = rel.*;
-            r.deinit(allocator);
-        }
-        relation_map.deinit();
-    }
+    // decoderbufs doesn't need relation_map - table names are included in each message
 
     // Run until graceful shutdown signal received
     while (!should_stop.load(.seq_cst)) {
@@ -344,87 +360,69 @@ pub fn main() !void {
 
                     // Parse messages with arena allocator
                     // Relations use main allocator since they persist in the map
-                    var parser = pgoutput.Parser.init(arena_allocator, wal_msg.payload);
-                    if (parser.parse()) |parsed_msg| {
-                        const pg_msg = parsed_msg;
-                        // No manual deinit needed - arena.deinit() handles everything
+                    // Parse decoderbufs protobuf message
+                    var parser = decoderbufs_parser.Parser.init(arena_allocator, wal_msg.payload);
+                    if (parser.parse()) |row_msg| {
+                        var row = row_msg;
+                        defer row.deinit(arena_allocator);
 
-                        switch (pg_msg) {
-                            .relation => |rel| {
-                                // Relations persist in the map, so clone with main allocator
-                                // (arena will be destroyed at end of scope)
-                                const cloned_rel = try rel.clone(allocator);
+                        // Get table name and operation
+                        const table_name = row.table orelse continue;
+                        const op = row.op orelse continue;
+                        const op_str = decoderbufs_parser.opToString(op);
 
-                                // If relation already exists, free the old one first
-                                const result = try relation_map.fetchPut(cloned_rel.relation_id, cloned_rel);
-                                if (result) |old_entry| {
-                                    var old_rel = old_entry.value;
-                                    old_rel.deinit(allocator);
-                                }
-                                // log.info("RELATION: {s}.{s} (id={d}, {d} columns)", .{ rel.namespace, rel.name, rel.relation_id, rel.columns.len });
-                            },
-                            .begin => |b| {
-                                log.info("BEGIN: xid={d} lsn={x}", .{ b.xid, b.final_lsn });
-                            },
-                            .insert => |ins| {
-                                if (relation_map.get(ins.relation_id)) |rel| {
-                                    try processCdcEvent(
-                                        arena_allocator,
-                                        rel,
-                                        ins.tuple_data,
-                                        "INSERT",
-                                        subject_prefix,
-                                        wal_msg.wal_end,
-                                        &batch_pub,
-                                        &metrics,
-                                    );
-                                    cdc_events += 1;
-                                }
-                            },
-                            .update => |upd| {
-                                if (relation_map.get(upd.relation_id)) |rel| {
-                                    try processCdcEvent(
-                                        arena_allocator,
-                                        rel,
-                                        upd.new_tuple,
-                                        "UPDATE",
-                                        subject_prefix,
-                                        wal_msg.wal_end,
-                                        &batch_pub,
-                                        &metrics,
-                                    );
-                                    cdc_events += 1;
-                                }
-                            },
-                            .delete => |del| {
-                                if (relation_map.get(del.relation_id)) |rel| {
-                                    try processCdcEvent(
-                                        arena_allocator,
-                                        rel,
-                                        del.old_tuple,
-                                        "DELETE",
-                                        subject_prefix,
-                                        wal_msg.wal_end,
-                                        &batch_pub,
-                                        &metrics,
-                                    );
-                                    cdc_events += 1;
-                                }
-                            },
-                            .commit => |c| {
-                                // Track LSN progression
-                                if (c.commit_lsn != last_lsn) {
-                                    const lsn_diff = c.commit_lsn - last_lsn;
-                                    log.info("COMMIT: lsn={x} (delta: +{d})", .{ c.commit_lsn, lsn_diff });
-                                    last_lsn = c.commit_lsn;
-                                } else {
-                                    log.info("COMMIT: lsn={x}", .{c.commit_lsn});
-                                }
-                            },
-                            else => {},
+                        // Skip BEGIN/COMMIT operations
+                        if (op == .BEGIN or op == .COMMIT) {
+                            if (op == .BEGIN) {
+                                log.info("BEGIN: xid={?d}", .{row.transaction_id});
+                            } else {
+                                log.info("COMMIT: time={?d}", .{row.commit_time});
+                            }
+                            continue;
                         }
+
+                        log.info("{s}: {s}", .{ op_str, table_name });
+
+                        // Log column values for debugging
+                        if (row.new_tuple.items.len > 0) {
+                            log.debug("  Columns:", .{});
+                            for (row.new_tuple.items) |datum| {
+                                if (datum.column_name) |col_name| {
+                                    const val_str = try decoderbufs_parser.datumToString(arena_allocator, datum);
+                                    log.debug("    {s} = {s}", .{ col_name, val_str });
+                                }
+                            }
+                        }
+
+                        // Build subject
+                        const op_lower = switch (op) {
+                            .INSERT => "insert",
+                            .UPDATE => "update",
+                            .DELETE => "delete",
+                            else => "unknown",
+                        };
+
+                        const subject = try std.fmt.allocPrintSentinel(
+                            arena_allocator,
+                            "{s}.{s}.{s}",
+                            .{ subject_prefix, table_name, op_lower },
+                            0,
+                        );
+
+                        // Generate message ID from WAL LSN
+                        const msg_id = try std.fmt.allocPrint(
+                            arena_allocator,
+                            "{x}-{s}-{s}",
+                            .{ wal_msg.wal_end, table_name, op_lower },
+                        );
+
+                        // Add to batch publisher (TODO: add column data decoding for protobuf)
+                        try batch_pub.addEvent(subject, table_name, op_str, msg_id, null);
+                        cdc_events += 1;
+                        metrics.incrementCdcEvents();
+                        log.info("  → Published to NATS: {s} (msg_id: {s})", .{ subject, msg_id });
                     } else |err| {
-                        log.warn("Failed to parse pgoutput message: {}", .{err});
+                        log.warn("Failed to parse decoderbufs message: {}", .{err});
                     }
                 }
 
