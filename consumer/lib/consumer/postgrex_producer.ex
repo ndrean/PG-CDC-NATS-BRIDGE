@@ -22,6 +22,10 @@ defmodule PgProducer do
     GenServer.call(__MODULE__, {:run, nb, name})
   end
 
+  def run_test() do
+    GenServer.call(__MODULE__, :run_test)
+  end
+
   @impl GenServer
   def init(opts) do
     tables = Keyword.get(opts, :tables, ["users"])
@@ -42,15 +46,26 @@ defmodule PgProducer do
     # Logger.info("Running PG statements...")
 
     # Generate list of maps for bulk insert
+
     values =
       for idx <- 1..nb do
-        user_name = "User #{idx}"
-
         %{
-          name: user_name,
-          email: "user#{idx}@example.com"
+          name: "User-#{i}-#{idx}",
+          email: "user-#{i}-#{idx}@example.com"
         }
       end
+
+    # for idx <- 1..nb do
+    #   values =
+    #     for j <- 1..nb do
+    #       %{
+    #         name: "User-#{i}-#{idx}-#{j}",
+    #         email: "user-#{i}-#{idx}-#{j}@example.com"
+    #       }
+    #     end
+
+    #   Producer.Repo.insert_all(name, values)
+    # end
 
     Producer.Repo.insert_all(name, values)
 
@@ -81,7 +96,7 @@ defmodule PgProducer do
 
     # Logger.info("PG job done")
 
-    {:reply, :ok, {pid, i}}
+    {:reply, :ok, {pid, i + 1}}
   end
 
   @impl GenServer
@@ -107,6 +122,31 @@ defmodule PgProducer do
     {:reply, :ok, state}
   end
 
+  def handle_call(:run_test, _, {pid, _} = state) do
+    test(pid)
+    {:reply, :ok, state}
+  end
+
+  defp create_table("test_types" = name, pid) do
+    %Postgrex.Result{} =
+      Postgrex.query!(pid, """
+      CREATE TABLE IF NOT EXISTS #{name} (
+        id SERIAL PRIMARY KEY,
+        age INT,
+        temperature FLOAT8,
+        price NUMERIC(20,8),
+        is_true BOOLEAN,
+        some_text TEXT,
+        tags TEXT[],
+        matrix INT[][],
+        metadata JSONB,
+        created_at TIMESTAMPTZ DEFAULT now()
+      );
+      """)
+
+    :ok
+  end
+
   defp create_table(name, pid) do
     %Postgrex.Result{} =
       Postgrex.query!(pid, """
@@ -120,7 +160,15 @@ defmodule PgProducer do
 
     :ok
   end
+
+  defp test(pid) do
+    %Postgrex.Result{} =
+      Postgrex.query!(pid, """
+      INSERT INTO test_types (age, temperature, is_true, some_text, tags, matrix, metadata, price)
+      VALUES (30, 36.6, true, 'Sample text', ARRAY['tag1', 'tag2'], ARRAY[[1,2],[3,4]], '{"key_1": "value_1",  "key_2": [1,2], "key_3": {"key_4": "value_4", "key_5": "value_5"}}'::jsonb, 123.45);
+      """)
+  end
 end
 
 # Stream.interval(1) |> Stream.take(1_000) |> Task.async_stream(fn _ -> PgProducer.run(100, Enum.random(["users", "orders"])) end, ordered: false) |> Stream.run()
-# Stream.interval(1) |> Stream.take(1_000) |> Task.async_stream(fn _ -> PgProducer.run(100, "users") end, ordered: false) |> Stream.run()
+# Stream.interval(1) |> Stream.take(5_000) |> Task.async_stream(fn _ -> PgProducer.run(100, "users") end, ordered: false) |> Stream.run()

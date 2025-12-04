@@ -1,6 +1,7 @@
 services:
   postgres:
-    image: quay.io/debezium/example-postgres:3.0
+    # image: quay.io/debezium/example-postgres:3.0
+    image: postgres:18
     container_name: postgres
     environment:
       POSTGRES_PASSWORD: postgres

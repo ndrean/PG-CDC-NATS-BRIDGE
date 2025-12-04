@@ -8,6 +8,7 @@ defmodule Consumer.Application do
   def start(_type, _args) do
     children = [
       Producer.Repo,
+      {Task, fn -> :setup_jet_stream end},
       {PgProducer, args()},
       {Gnat.ConnectionSupervisor, gnat_supervisor_settings()},
       # JetStream pull consumer for CDC events
@@ -18,10 +19,20 @@ defmodule Consumer.Application do
     Supervisor.start_link(children, opts)
   end
 
+  def setup_jet_stream do
+    name = System.get_env("NATS_STREAM_NAME") || "cdc_rt"
+
+    {:ok, %{created: _}} =
+      Gnat.Jetstream.API.Stream.create(:gnat, %Gnat.Jetstream.API.Stream{
+        name: name,
+        subjects: [name <> ".>"]
+      })
+
+    {:ok, %{created: _}} = Gnat.Jetstream.API.Stream.info(:gnat, name)
+  end
+
   defp get_tables do
-    System.get_env("TABLES")
-    |> String.split(",")
-    |> Enum.map(&String.trim/1)
+    System.get_env("TABLES") |> String.split(",") |> Enum.map(&String.trim/1)
   end
 
   defp args do

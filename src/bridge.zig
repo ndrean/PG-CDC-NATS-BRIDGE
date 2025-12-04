@@ -5,6 +5,8 @@ const wal_stream = @import("wal_stream.zig");
 const pgoutput = @import("pgoutput.zig");
 const nats_publisher = @import("nats_publisher.zig");
 const batch_publisher = @import("batch_publisher.zig");
+const async_batch_publisher = @import("async_batch_publisher.zig");
+const async_direct_publisher = @import("async_direct_publisher.zig");
 const replication_setup = @import("replication_setup.zig");
 const msgpack = @import("msgpack");
 const http_server = @import("http_server.zig");
@@ -21,24 +23,41 @@ var should_stop = std.atomic.Value(bool).init(false);
 /// Helper to process and publish a CDC event (INSERT/UPDATE/DELETE)
 fn processCdcEvent(
     arena_allocator: std.mem.Allocator,
+    main_allocator: std.mem.Allocator,
     rel: pgoutput.RelationMessage,
     tuple_data: pgoutput.TupleData,
     operation: []const u8,
     subject_prefix: []const u8,
     wal_end: u64,
-    batch_pub: *batch_publisher.BatchPublisher,
+    batch_pub: *async_batch_publisher.AsyncBatchPublisher,
     metrics: *metrics_mod.Metrics,
 ) !void {
     // Decode tuple data to get actual column values
+    // Use main_allocator so decoded values survive arena.deinit()
     var decoded_values = pgoutput.decodeTuple(
-        arena_allocator,
+        main_allocator,
         tuple_data,
         rel.columns,
     ) catch |err| {
         log.warn("Failed to decode tuple: {}", .{err});
         return;
     };
-    defer decoded_values.deinit();
+    // NOTE: batch_pub.addEvent() duplicates the values, so we need to free the originals
+    defer {
+        // Free slice-based values before deinit
+        var it = decoded_values.iterator();
+        while (it.next()) |entry| {
+            switch (entry.value_ptr.*) {
+                .text => |txt| main_allocator.free(txt),
+                .numeric => |num| main_allocator.free(num),
+                .array => |arr| main_allocator.free(arr),
+                .jsonb => |jsn| main_allocator.free(jsn),
+                .bytea => |byt| main_allocator.free(byt),
+                else => {}, // int32, int64, float64, boolean don't need freeing
+            }
+        }
+        decoded_values.deinit();
+    }
 
     // Extract ID value for logging (if present)
     const id_str = if (decoded_values.get("id")) |id_value| blk: {
@@ -68,8 +87,8 @@ fn processCdcEvent(
         .{ wal_end, rel.name, operation_lower },
     );
 
-    // Add to batch publisher with column data
-    try batch_pub.addEvent(subject, rel.name, operation, msg_id, decoded_values);
+    // Add to batch publisher with column data and LSN
+    try batch_pub.addEvent(subject, rel.name, operation, msg_id, decoded_values, wal_end);
     metrics.incrementCdcEvents();
 
     // Log single line with table, operation, and ID
@@ -224,15 +243,17 @@ pub fn main() !void {
     // Make publisher available to HTTP server for stream management
     http_srv.nats_publisher = &publisher;
 
-    // Initialize batch publisher (always enabled)
+    // Initialize async batch publisher (with dedicated flush thread)
     const batch_config = batch_publisher.BatchConfig{
-        .max_events = 100,
-        .max_wait_ms = 50,
+        .max_events = 200,
+        .max_wait_ms = 100,
         .max_payload_bytes = 64 * 1024,
     };
-    var batch_pub = batch_publisher.BatchPublisher.init(allocator, &publisher, batch_config);
+    var batch_pub = try async_batch_publisher.AsyncBatchPublisher.init(allocator, &publisher, batch_config);
     defer batch_pub.deinit();
-    log.info("✅ Batch publishing enabled (max {d} events or {d}ms or {d}KB)\n", .{ batch_config.max_events, batch_config.max_wait_ms, batch_config.max_payload_bytes / 1024 });
+    // Start flush thread after batch_pub is at its final memory location
+    try batch_pub.start();
+    log.info("✅ Async batch publishing enabled (max {d} events or {d}ms or {d}KB)\n", .{ batch_config.max_events, batch_config.max_wait_ms, batch_config.max_payload_bytes / 1024 });
 
     // Get current LSN to skip historical data
     log.info(" \nGetting current LSN position...", .{});
@@ -280,7 +301,6 @@ pub fn main() !void {
     const keepalive_interval_seconds: i64 = 30; // Send keepalive every 30 seconds
 
     // Status update batching to reduce PostgreSQL round trips
-    var pending_ack_lsn: u64 = 0; // LSN waiting to be acknowledged
     var messages_since_ack: u32 = 0; // Count messages since last ack
     var last_status_update_time = std.time.timestamp();
     const status_update_interval_seconds: i64 = 10; // Send status update every 10 seconds
@@ -304,6 +324,11 @@ pub fn main() !void {
         }
         relation_map.deinit();
     }
+
+    // Create arena allocator once and reuse it for all message parsing
+    // This avoids creating/destroying arena 70k times per second at high throughput
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
 
     // Run until graceful shutdown signal received
     while (!should_stop.load(.seq_cst)) {
@@ -336,10 +361,9 @@ pub fn main() !void {
 
                 // Parse and publish pgoutput messages
                 if (wal_msg.type == .xlogdata and wal_msg.payload.len > 0) {
-                    // Use arena allocator for all parsing and temporary allocations
-                    // This reduces 10-15 allocations per event to just 1
-                    var arena = std.heap.ArenaAllocator.init(allocator);
-                    defer arena.deinit(); // Frees all parsing + temp allocations at once
+                    // Reset arena for this message (retains capacity for efficiency)
+                    // This frees all allocations from previous message while keeping the memory buffer
+                    defer _ = arena.reset(.retain_capacity);
                     const arena_allocator = arena.allocator();
 
                     // Parse messages with arena allocator
@@ -370,6 +394,7 @@ pub fn main() !void {
                                 if (relation_map.get(ins.relation_id)) |rel| {
                                     try processCdcEvent(
                                         arena_allocator,
+                                        allocator,
                                         rel,
                                         ins.tuple_data,
                                         "INSERT",
@@ -385,6 +410,7 @@ pub fn main() !void {
                                 if (relation_map.get(upd.relation_id)) |rel| {
                                     try processCdcEvent(
                                         arena_allocator,
+                                        allocator,
                                         rel,
                                         upd.new_tuple,
                                         "UPDATE",
@@ -400,6 +426,7 @@ pub fn main() !void {
                                 if (relation_map.get(del.relation_id)) |rel| {
                                     try processCdcEvent(
                                         arena_allocator,
+                                        allocator,
                                         rel,
                                         del.old_tuple,
                                         "DELETE",
@@ -428,25 +455,28 @@ pub fn main() !void {
                     }
                 }
 
-                // Buffer acknowledgment instead of sending immediately
+                // Track the latest WAL position we've received
                 if (wal_msg.wal_end > 0) {
-                    pending_ack_lsn = wal_msg.wal_end;
                     messages_since_ack += 1;
                     metrics.updateLsn(wal_msg.wal_end);
                 }
 
+                // Get the last LSN confirmed by NATS (after successful flush)
+                const confirmed_lsn = batch_pub.getLastConfirmedLsn();
+
                 // Send buffered status update if we hit time or message threshold
+                // Only ACK up to the LSN that NATS has confirmed
                 const now = std.time.timestamp();
-                if (pending_ack_lsn > 0 and
+                if (confirmed_lsn > last_ack_lsn and
                     (messages_since_ack >= status_update_message_count or
                         now - last_status_update_time >= status_update_interval_seconds))
                 {
-                    try pg_stream.sendStatusUpdate(pending_ack_lsn);
-                    last_ack_lsn = pending_ack_lsn;
+                    try pg_stream.sendStatusUpdate(confirmed_lsn);
+                    log.debug("ACKed to PostgreSQL: LSN {x} (NATS confirmed)", .{confirmed_lsn});
+                    last_ack_lsn = confirmed_lsn;
                     messages_since_ack = 0;
                     last_status_update_time = now;
                     last_keepalive_time = now; // Reset keepalive timer
-                    log.debug("Sent buffered status update (LSN: {x}, buffered {} messages)", .{ pending_ack_lsn, messages_since_ack });
                 }
 
                 // Record processing time
@@ -457,14 +487,17 @@ pub fn main() !void {
                 // No message available - check if we need to send pending acks or keepalive
                 const now = std.time.timestamp();
 
+                // Get the last LSN confirmed by NATS
+                const confirmed_lsn = batch_pub.getLastConfirmedLsn();
+
                 // Flush pending status updates if time threshold reached
-                if (pending_ack_lsn > 0 and now - last_status_update_time >= status_update_interval_seconds) {
-                    try pg_stream.sendStatusUpdate(pending_ack_lsn);
-                    last_ack_lsn = pending_ack_lsn;
+                if (confirmed_lsn > last_ack_lsn and now - last_status_update_time >= status_update_interval_seconds) {
+                    try pg_stream.sendStatusUpdate(confirmed_lsn);
+                    log.debug("ACKed to PostgreSQL on idle: LSN {x} (NATS confirmed)", .{confirmed_lsn});
+                    last_ack_lsn = confirmed_lsn;
                     messages_since_ack = 0;
                     last_status_update_time = now;
                     last_keepalive_time = now;
-                    log.debug("Sent buffered status update on idle (LSN: {x})", .{pending_ack_lsn});
                 } else if (now - last_keepalive_time >= keepalive_interval_seconds) {
                     // Send keepalive status update to prevent timeout
                     if (last_ack_lsn > 0) {
@@ -474,12 +507,14 @@ pub fn main() !void {
                     }
                 }
 
-                // Check if batch needs time-based flush
+                // Check if batch should be flushed based on time
                 if (batch_pub.shouldFlushByTime()) {
-                    try batch_pub.flush();
+                    try batch_pub.triggerFlush();
+                    log.debug("Triggered time-based batch flush", .{});
                 }
 
-                // Flush NATS async publishes periodically
+                // Direct publisher handles its own flushing
+                // Flush NATS async publishes periodically (backup flush)
                 if (now - last_nats_flush_time >= nats_flush_interval_seconds) {
                     try publisher.flushAsync();
                     last_nats_flush_time = now;

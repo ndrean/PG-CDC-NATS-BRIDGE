@@ -36,7 +36,8 @@ pub const CommitMessage = struct {
 };
 
 /// PostgreSQL built-in Type OIDs (Object IDs).
-/// These values are standard.
+///
+/// These values are standard and obtained from PostgreSQL with: `docker exec postgres psql -U postgres -d postgres -c "SELECT oid, typname FROM pg_type WHERE typname IN ('bool', 'int2', 'int4', 'int8', 'float4', 'float8', 'text', 'varchar', 'bpchar', 'date', 'timestamptz', 'uuid', 'bytea', 'jsonb', 'numeric', '_int4', '_text', '_jsonb') ORDER BY oid;"`
 pub const PgOid = enum(u32) {
     // Numeric Types
     BOOL = 16,
@@ -53,27 +54,302 @@ pub const PgOid = enum(u32) {
 
     // Date/Time Types
     DATE = 1082,
+    TIMESTAMP = 1114, // timestamp without time zone (8 bytes)
     TIMESTAMPTZ = 1184, // timestamp with time zone (8 bytes)
 
     // Others
     UUID = 2950,
     BYTEA = 17,
+    JSON = 114, // json (text format, before jsonb)
     JSONB = 3802,
     NUMERIC = 1700,
+
+    // Array Types (prefixed with underscore in PostgreSQL)
+    ARRAY_INT2 = 1005, // _int2 (smallint[])
+    ARRAY_INT4 = 1007, // _int4 (integer[])
+    ARRAY_INT8 = 1016, // _int8 (bigint[])
+    ARRAY_TEXT = 1009, // _text (text[])
+    ARRAY_VARCHAR = 1015, // _varchar (varchar[])
+    ARRAY_FLOAT4 = 1021, // _float4 (float4[])
+    ARRAY_FLOAT8 = 1022, // _float8 (float8[])
+    ARRAY_BOOL = 1000, // _bool (boolean[])
+    ARRAY_JSONB = 3807, // _jsonb (jsonb[])
+    ARRAY_NUMERIC = 1231, // _numeric (numeric[])
+    ARRAY_UUID = 2951, // _uuid (uuid[])
+    ARRAY_TIMESTAMPTZ = 1185, // _timestamptz (timestamptz[])
+
     _, // Placeholder for unsupported types
 };
 
+const NUMERIC_POS: u16 = 0x0000;
+const NUMERIC_NEG: u16 = 0x4000;
+const NUMERIC_NAN: u16 = 0xC000;
+const NUMERIC_PINF: u16 = 0xD000;
+const NUMERIC_NINF: u16 = 0xF000;
+
+const NBASE: u16 = 10000; // Each digit represents 4 decimal digits
+
 /// Decoded column value representation
 pub const DecodedValue = union(enum) {
+    null,
+    boolean: bool,
     int32: i32,
     int64: i64,
     float64: f64,
-    boolean: bool,
-    text: []const u8,
-    // Add more types as you implement them (e.g., date, timestamp, bytea)
+    text: []const u8, // TEXT, VARCHAR, CHAR, UUID, DATE, TIMESTAMPTZ
+    numeric: []const u8, // NUMERIC - keep as decimal string
+    jsonb: []const u8, // JSONB - as JSON string
+    array: []const u8, // ARRAY - as JSON string
+    bytea: []const u8, // BYTEA - raw bytes or hex/base64 encoded
 };
 
-/// Decodes the raw bytes based on the PostgreSQL type OID.
+/// Decodes the raw bytes based on the PostgreSQL type OID (BINARY format).
+///
+/// This version handles binary-encoded data from PostgreSQL when using
+/// START_REPLICATION with binary 'true'.
+/// Returns the same DecodedValue types as decodeColumnData() for compatibility.
+pub fn decodeBinColumnData(
+    allocator: std.mem.Allocator,
+    type_id: u32,
+    raw_bytes: []const u8,
+) !DecodedValue {
+    const array_mod = @import("array.zig");
+    const numeric_mod = @import("numeric.zig");
+    _ = @import("jsonb.zig"); // TODO: Use when implementing JSONB binary parsing
+
+    const oid: PgOid = @enumFromInt(type_id);
+
+    return switch (oid) {
+        // --- Fixed-Width Numeric Types (Binary format) ---
+        .BOOL => {
+            if (raw_bytes.len != 1) return error.InvalidDataLength;
+            return .{ .boolean = raw_bytes[0] != 0 };
+        },
+
+        .INT2 => {
+            if (raw_bytes.len != 2) return error.InvalidDataLength;
+            const val = std.mem.readInt(i16, raw_bytes[0..2], .big);
+            return .{ .int32 = @intCast(val) };
+        },
+
+        .INT4 => {
+            if (raw_bytes.len != 4) return error.InvalidDataLength;
+            const val = std.mem.readInt(i32, raw_bytes[0..4], .big);
+            return .{ .int32 = val };
+        },
+
+        .INT8 => {
+            if (raw_bytes.len != 8) return error.InvalidDataLength;
+            const val = std.mem.readInt(i64, raw_bytes[0..8], .big);
+            return .{ .int64 = val };
+        },
+
+        .FLOAT4 => {
+            if (raw_bytes.len != 4) return error.InvalidDataLength;
+            const bits = std.mem.readInt(u32, raw_bytes[0..4], .big);
+            const val: f32 = @bitCast(bits);
+            return .{ .float64 = @floatCast(val) };
+        },
+
+        .FLOAT8 => {
+            if (raw_bytes.len != 8) return error.InvalidDataLength;
+            const bits = std.mem.readInt(u64, raw_bytes[0..8], .big);
+            const val: f64 = @bitCast(bits);
+            return .{ .float64 = val };
+        },
+
+        // --- Date/Time Types (Binary format) ---
+        .DATE => {
+            if (raw_bytes.len != 4) return error.InvalidDataLength;
+            const days = std.mem.readInt(i32, raw_bytes[0..4], .big);
+            // PostgreSQL epoch: 2000-01-01, convert to text
+            const date_str = try std.fmt.allocPrint(allocator, "2000-01-01 + {d} days", .{days});
+            return .{ .text = date_str };
+        },
+
+        .TIMESTAMP, .TIMESTAMPTZ => {
+            // Both use identical binary format: 8 bytes of microseconds since PG epoch
+            // TIMESTAMPTZ is timezone-aware, TIMESTAMP is not, but encoding is the same
+            if (raw_bytes.len != 8) return error.InvalidDataLength;
+            const microseconds = std.mem.readInt(i64, raw_bytes[0..8], .big);
+            // PostgreSQL epoch: 2000-01-01 00:00:00 (946684800 Unix timestamp)
+            const pg_epoch_unix: i64 = 946684800;
+            const unix_seconds = pg_epoch_unix + @divFloor(microseconds, 1_000_000);
+            const micros = @abs(@mod(microseconds, 1_000_000));
+
+            // Format as Unix timestamp with microseconds
+            const ts_str = try std.fmt.allocPrint(
+                allocator,
+                "{d}.{d:0>6}",
+                .{ unix_seconds, micros }
+            );
+            return .{ .text = ts_str };
+        },
+
+        // --- UUID (Binary format - 16 bytes) ---
+        .UUID => {
+            if (raw_bytes.len != 16) return error.InvalidDataLength;
+            const uuid_str = try std.fmt.allocPrint(
+                allocator,
+                "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}",
+                .{
+                    raw_bytes[0],  raw_bytes[1],  raw_bytes[2],  raw_bytes[3],
+                    raw_bytes[4],  raw_bytes[5],  raw_bytes[6],  raw_bytes[7],
+                    raw_bytes[8],  raw_bytes[9],  raw_bytes[10], raw_bytes[11],
+                    raw_bytes[12], raw_bytes[13], raw_bytes[14], raw_bytes[15],
+                },
+            );
+            return .{ .text = uuid_str };
+        },
+
+        // --- Variable-Length Text Types (Binary format is still text) ---
+        .TEXT, .VARCHAR, .BPCHAR => {
+            // raw_bytes is from readBytes() which uses arena_allocator
+            // We need to dupe with main_allocator so it survives arena cleanup
+            const owned = try allocator.dupe(u8, raw_bytes);
+            return .{ .text = owned };
+        },
+
+        .BYTEA => {
+            // raw_bytes is from readBytes() which uses arena_allocator
+            // We need to dupe with main_allocator so it survives arena cleanup
+            const owned = try allocator.dupe(u8, raw_bytes);
+            return .{ .bytea = owned };
+        },
+
+        // --- NUMERIC (Binary format - use numeric.zig) ---
+        .NUMERIC => {
+            const result = try numeric_mod.parseNumeric(allocator, raw_bytes);
+            // parseNumeric returns NumericResult { .slice, .allocated }
+            // where .slice is a sub-slice of .allocated pointing to the actual data
+            //
+            // The issue with dupe+free was that we were freeing result.allocated
+            // immediately after duping result.slice, which could cause issues.
+            //
+            // Better approach: Use realloc to shrink the buffer to exact size.
+            // This avoids the dupe+free dance and is more efficient.
+            const exact_size = result.slice.len;
+            if (allocator.resize(result.allocated, exact_size)) {
+                // Resize succeeded in-place
+                return .{ .numeric = result.allocated[0..exact_size] };
+            } else {
+                // Need to allocate new buffer
+                const owned = try allocator.dupe(u8, result.slice);
+                allocator.free(result.allocated);
+                return .{ .numeric = owned };
+            }
+        },
+
+        // --- JSON (text format even in binary mode) ---
+        .JSON => {
+            // PostgreSQL sends JSON as plain text even when binary format is requested
+            const owned = try allocator.dupe(u8, raw_bytes);
+            return .{ .jsonb = owned }; // Use jsonb field for compatibility
+        },
+
+        // --- JSONB (binary format is version byte + JSON text) ---
+        .JSONB => {
+            // PostgreSQL JSONB v1 format: version byte (0x01) + plain JSON text
+            // No complex parsing needed - just skip the version byte
+            if (raw_bytes.len < 1) return error.InvalidDataLength;
+            const version = raw_bytes[0];
+            if (version != 1) return error.UnsupportedJsonbVersion;
+
+            // Skip version byte, return JSON text
+            const owned = try allocator.dupe(u8, raw_bytes[1..]);
+            return .{ .jsonb = owned };
+        },
+
+        // --- Array Types (Binary format - use array.zig) ---
+        .ARRAY_INT2, .ARRAY_INT4, .ARRAY_INT8, .ARRAY_TEXT, .ARRAY_VARCHAR, .ARRAY_FLOAT4, .ARRAY_FLOAT8, .ARRAY_BOOL, .ARRAY_JSONB, .ARRAY_NUMERIC, .ARRAY_UUID, .ARRAY_TIMESTAMPTZ => {
+            const parsed = try array_mod.parseArray(allocator, raw_bytes);
+            defer parsed.deinit(allocator);
+
+            // Convert ArrayResult to PostgreSQL text format: {1,2,3}
+            const text_repr = try arrayToText(allocator, parsed);
+            return .{ .array = text_repr };
+        },
+
+        // --- Handle ENUMs and unknown types gracefully ---
+        else => {
+            // ENUMs and other user-defined types are sent as text in binary format
+            // Treat them as TEXT and log a warning for visibility
+            log.warn("Unknown type OID {d}, treating as text", .{type_id});
+            const owned = try allocator.dupe(u8, raw_bytes);
+            return .{ .text = owned };
+        },
+    };
+}
+
+/// Helper: Convert ArrayResult to PostgreSQL text format
+fn arrayToText(allocator: std.mem.Allocator, arr: @import("array.zig").ArrayResult) ![]const u8 {
+    var buffer: std.ArrayList(u8) = .empty;
+    errdefer buffer.deinit(allocator);
+
+    const writer = buffer.writer(allocator);
+
+    // Handle multi-dimensional arrays
+    if (arr.ndim > 1) {
+        try writer.writeByte('{');
+        // For simplicity, flatten to 1D for now
+        // TODO: Handle proper multi-dimensional formatting
+    } else {
+        try writer.writeByte('{');
+    }
+
+    for (arr.elements, 0..) |elem, i| {
+        if (i > 0) try writer.writeByte(',');
+
+        switch (elem) {
+            .null_value => try writer.writeAll("NULL"),
+            .data => |data| {
+                // Decode based on element OID
+                const oid: PgOid = @enumFromInt(arr.element_oid);
+                switch (oid) {
+                    .INT2 => {
+                        const val = std.mem.readInt(i16, data[0..2], .big);
+                        try writer.print("{d}", .{val});
+                    },
+                    .INT4 => {
+                        const val = std.mem.readInt(i32, data[0..4], .big);
+                        try writer.print("{d}", .{val});
+                    },
+                    .INT8 => {
+                        const val = std.mem.readInt(i64, data[0..8], .big);
+                        try writer.print("{d}", .{val});
+                    },
+                    .TEXT, .VARCHAR => {
+                        try writer.writeByte('"');
+                        try writer.writeAll(data);
+                        try writer.writeByte('"');
+                    },
+                    .FLOAT8 => {
+                        const bits = std.mem.readInt(u64, data[0..8], .big);
+                        const val: f64 = @bitCast(bits);
+                        try writer.print("{d}", .{val});
+                    },
+                    .BOOL => {
+                        const val = data[0] != 0;
+                        try writer.writeAll(if (val) "t" else "f");
+                    },
+                    else => {
+                        // Fallback: hex encode
+                        try writer.writeAll("\\x");
+                        for (data) |byte| {
+                            try writer.print("{x:0>2}", .{byte});
+                        }
+                    },
+                }
+            },
+        }
+    }
+
+    try writer.writeByte('}');
+
+    return buffer.toOwnedSlice(allocator);
+}
+
+/// Decodes the raw bytes based on the PostgreSQL type OID (TEXT format).
 ///
 /// Note: pgoutput sends data in TEXT format by default, not binary!
 /// raw_bytes contains the UTF-8 text representation of the value.
@@ -157,9 +433,41 @@ pub fn decodeColumnData(
             return .{ .text = raw_bytes }; // Representing as raw byte slice
         },
 
-        // --- 3. TODO Complex/Other Types ------------------------------------
+        // --- 3. Complex Types (TEXT format) ---------------------------------
 
-        // specific decoding logic: JSONB, NUMERIC, Arrays, UUID (16 bytes)
+        // JSONB - text format is already JSON string
+        .JSONB => {
+            return .{ .jsonb = raw_bytes };
+        },
+
+        // NUMERIC - text format is decimal string like "123.456"
+        .NUMERIC => {
+            return .{ .numeric = raw_bytes };
+        },
+
+        // --- 4. Array Types (TEXT format) -----------------------------------
+        // PostgreSQL text array format: {val1,val2,val3} or {{1,2},{3,4}}
+
+        .ARRAY_INT2,
+        .ARRAY_INT4,
+        .ARRAY_INT8,
+        .ARRAY_TEXT,
+        .ARRAY_VARCHAR,
+        .ARRAY_FLOAT4,
+        .ARRAY_FLOAT8,
+        .ARRAY_BOOL,
+        .ARRAY_JSONB,
+        .ARRAY_NUMERIC,
+        .ARRAY_UUID,
+        .ARRAY_TIMESTAMPTZ,
+        => {
+            // Arrays in TEXT format come as PostgreSQL text representation
+            // Examples: {1,2,3}, {"a","b","c"}, {{1,2},{3,4}}
+            return .{ .array = raw_bytes };
+        },
+
+        // --- 5. Unsupported Types -------------------------------------------
+
         else => return error.UnsupportedType,
     };
 }
@@ -295,13 +603,17 @@ pub fn decodeTuple(
 
     for (columns, tuple.columns) |col_info, col_data| {
         if (col_data) |raw_bytes| {
-            const decoded_value = decodeColumnData(allocator, col_info.type_id, raw_bytes) catch |err| {
+            // Log raw text value for debugging
+            log.debug("Column '{s}' (OID={d}): '{s}'", .{ col_info.name, col_info.type_id, raw_bytes });
+
+            const decoded_value = decodeBinColumnData(allocator, col_info.type_id, raw_bytes) catch |err| {
                 log.err("Failed to decode column '{s}' (type_id={d}, bytes={d}): {}", .{ col_info.name, col_info.type_id, raw_bytes.len, err });
                 return err;
             };
             try decoded_map.put(col_info.name, decoded_value);
         } else {
             // Handle NULL values
+            log.debug("Column '{s}' is NULL", .{col_info.name});
             // skip? or use a custom DecodedValue union option for NULL?)
         }
     }
@@ -516,8 +828,18 @@ pub const Parser = struct {
                 'n' => null, // NULL value
                 'u' => null, // Unchanged TOASTed value
                 't' => blk: {
+                    // Text format column data
                     const len = try self.readU32();
-                    break :blk try self.readBytes(len);
+                    const data = try self.readBytes(len);
+                    log.debug("Column {d}: TEXT format, len={d}", .{ i, len });
+                    break :blk data;
+                },
+                'b' => blk: {
+                    // Binary format column data
+                    const len = try self.readU32();
+                    const data = try self.readBytes(len);
+                    log.debug("Column {d}: BINARY format, len={d}", .{ i, len });
+                    break :blk data;
                 },
                 else => {
                     log.warn("Unknown column type: {c}", .{col_type});

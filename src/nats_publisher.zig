@@ -219,11 +219,23 @@ pub const Publisher = struct {
             return error.NotConnected;
         }
 
-        const status = c.js_PublishAsyncComplete(self.js, null);
-        if (status != c.NATS_OK) {
-            log.warn("🔴 Async publish completion had errors: {s}", .{c.natsStatus_GetText(status)});
-            // Don't return error - some publishes may have succeeded
+        log.debug("Flushing async publishes...", .{});
+
+        // Set a timeout of 5 seconds for flush
+        var opts: c.jsPubOptions = undefined;
+        const init_status = c.jsPubOptions_Init(&opts);
+        if (init_status != c.NATS_OK) {
+            log.err("Failed to initialize jsPubOptions for flush", .{});
+            return error.InitFailed;
         }
+        opts.MaxWait = 5000; // 5 seconds timeout
+
+        const status = c.js_PublishAsyncComplete(self.js, &opts);
+        if (status != c.NATS_OK) {
+            log.err("🔴 Async publish completion failed: {s}", .{c.natsStatus_GetText(status)});
+            return error.FlushFailed;
+        }
+        log.debug("✅ Async publishes flushed successfully", .{});
     }
 
     /// Get stream information as JSON

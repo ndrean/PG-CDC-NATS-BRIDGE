@@ -14,7 +14,7 @@ services:
         --slot cdc_slot
         --publication cdc_pub
         --port 8080
-        --table users,orders
+        --table users,orders,test_types
     depends_on:
       postgres:
         condition: service_healthy

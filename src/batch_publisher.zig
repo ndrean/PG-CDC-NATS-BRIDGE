@@ -8,7 +8,7 @@ pub const log = std.log.scoped(.batch_publisher);
 /// Configuration for batch publishing
 pub const BatchConfig = struct {
     /// Maximum number of events per batch
-    max_events: usize = 200,
+    max_events: usize = 100,
     /// Maximum time to wait before flushing (milliseconds)
     max_wait_ms: i64 = 100,
     /// Maximum payload size in bytes
@@ -22,6 +22,7 @@ pub const CDCEvent = struct {
     operation: []const u8,
     msg_id: []const u8,
     data: ?std.StringHashMap(pgoutput.DecodedValue),
+    lsn: u64, // WAL LSN for this event
 
     pub fn deinit(self: *CDCEvent, allocator: std.mem.Allocator) void {
         allocator.free(self.subject);
@@ -30,14 +31,18 @@ pub const CDCEvent = struct {
         allocator.free(self.msg_id);
 
         if (self.data) |*data_map| {
-            // Free all keys and text values in the hashmap
+            // Free all keys and slice-based values in the hashmap
             var it = data_map.iterator();
             while (it.next()) |entry| {
                 allocator.free(entry.key_ptr.*);
-                // Free text values (other types are copied by value, no allocation)
+                // Free slice-based values (text, numeric, array, jsonb, bytea)
                 switch (entry.value_ptr.*) {
                     .text => |txt| allocator.free(txt),
-                    else => {},
+                    .numeric => |num| allocator.free(num),
+                    .array => |arr| allocator.free(arr),
+                    .jsonb => |jsn| allocator.free(jsn),
+                    .bytea => |byt| allocator.free(byt),
+                    else => {}, // int32, int64, float64, boolean don't need freeing
                 }
             }
             data_map.deinit();
@@ -55,6 +60,7 @@ pub const BatchPublisher = struct {
     events: std.ArrayList(CDCEvent),
     current_payload_size: usize,
     last_flush_time: i64,
+    last_confirmed_lsn: u64,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -68,12 +74,13 @@ pub const BatchPublisher = struct {
             .events = std.ArrayList(CDCEvent){},
             .current_payload_size = 0,
             .last_flush_time = std.time.milliTimestamp(),
+            .last_confirmed_lsn = 0,
         };
     }
 
     pub fn deinit(self: *BatchPublisher) void {
         // Flush any remaining events
-        self.flush() catch |err| {
+        _ = self.flush() catch |err| {
             log.err("Failed to flush remaining events during deinit: {}", .{err});
         };
 
@@ -92,6 +99,7 @@ pub const BatchPublisher = struct {
         operation: []const u8,
         msg_id: []const u8,
         data: ?std.StringHashMap(pgoutput.DecodedValue),
+        lsn: u64,
     ) !void {
         // Make owned copies of the data
         const owned_subject = try self.allocator.dupeZ(u8, subject);
@@ -114,9 +122,13 @@ pub const BatchPublisher = struct {
             while (it.next()) |entry| {
                 const owned_key = try self.allocator.dupe(u8, entry.key_ptr.*);
 
-                // Deep copy the value, especially text fields
+                // Deep copy the value, especially text-based fields (slices)
                 const owned_value = switch (entry.value_ptr.*) {
                     .text => |txt| pgoutput.DecodedValue{ .text = try self.allocator.dupe(u8, txt) },
+                    .numeric => |num| pgoutput.DecodedValue{ .numeric = try self.allocator.dupe(u8, num) },
+                    .array => |arr| pgoutput.DecodedValue{ .array = try self.allocator.dupe(u8, arr) },
+                    .jsonb => |jsn| pgoutput.DecodedValue{ .jsonb = try self.allocator.dupe(u8, jsn) },
+                    .bytea => |byt| pgoutput.DecodedValue{ .bytea = try self.allocator.dupe(u8, byt) },
                     else => entry.value_ptr.*, // int32, int64, float64, boolean are copied by value
                 };
 
@@ -130,6 +142,7 @@ pub const BatchPublisher = struct {
             .operation = owned_operation,
             .msg_id = owned_msg_id,
             .data = owned_data,
+            .lsn = lsn,
         };
 
         try self.events.append(self.allocator, event);
@@ -140,7 +153,7 @@ pub const BatchPublisher = struct {
         if (self.events.items.len >= self.config.max_events or
             self.current_payload_size >= self.config.max_payload_bytes)
         {
-            try self.flush();
+            _ = try self.flush();
         }
     }
 
@@ -153,19 +166,35 @@ pub const BatchPublisher = struct {
         return elapsed >= self.config.max_wait_ms;
     }
 
+    /// Get the last LSN that was successfully confirmed by NATS
+    pub fn getLastConfirmedLsn(self: *BatchPublisher) u64 {
+        return self.last_confirmed_lsn;
+    }
+
     /// Flush accumulated events to NATS
-    pub fn flush(self: *BatchPublisher) !void {
-        if (self.events.items.len == 0) return;
+    /// Returns the maximum LSN that was successfully flushed, or 0 if no events
+    pub fn flush(self: *BatchPublisher) !u64 {
+        if (self.events.items.len == 0) return 0;
+
+        // Calculate maximum LSN in this batch
+        var max_lsn: u64 = 0;
+        for (self.events.items) |event| {
+            if (event.lsn > max_lsn) {
+                max_lsn = event.lsn;
+            }
+        }
 
         const flush_start = std.time.milliTimestamp();
         const event_count = self.events.items.len;
+
+        log.info("📦 Starting flush of {d} events", .{event_count});
 
         // For single event, encode and publish directly
         if (event_count == 1) {
             const event = self.events.items[0];
 
             // Use ArrayList for dynamic buffer (no fixed size limit)
-            var buffer = std.ArrayList(u8){};
+            var buffer: std.ArrayList(u8) = .empty;
             defer buffer.deinit(self.allocator);
 
             // Create a stream wrapper for ArrayList
@@ -203,7 +232,10 @@ pub const BatchPublisher = struct {
                 ArrayListStream.ReadError,
                 ArrayListStream.write,
                 ArrayListStream.read,
-            ).init(&write_stream, &read_stream);
+            ).init(
+                &write_stream,
+                &read_stream,
+            );
 
             var event_map = msgpack.Payload.mapPayload(self.allocator);
             errdefer event_map.free(self.allocator);
@@ -229,7 +261,11 @@ pub const BatchPublisher = struct {
                         .int64 => |v| msgpack.Payload{ .int = v },
                         .float64 => |v| msgpack.Payload{ .float = v },
                         .boolean => |v| msgpack.Payload{ .bool = v },
-                        .text => |v| try msgpack.Payload.strToPayload(v, self.allocator),
+                        .text, .bytea, .array, .jsonb, .numeric => |v| try msgpack.Payload.strToPayload(v, self.allocator),
+                        else => {
+                            log.err("Unsupported data type in single event publishing", .{});
+                            return error.UnsupportedDataType;
+                        },
                     };
 
                     try data_payload.mapPut(col_name, value_payload);
@@ -242,6 +278,10 @@ pub const BatchPublisher = struct {
             const encoded = buffer.items;
 
             try self.publisher.publish(event.subject, encoded, event.msg_id);
+
+            // Flush async publishes to actually send them to NATS
+            try self.publisher.flushAsync();
+
             log.debug("Published single event: {s}", .{event.subject});
 
             // Free payload structures after encoding is complete
@@ -297,6 +337,11 @@ pub const BatchPublisher = struct {
                             .float64 => |v| msgpack.Payload{ .float = v },
                             .boolean => |v| msgpack.Payload{ .bool = v },
                             .text => |v| try msgpack.Payload.strToPayload(v, encoding_allocator),
+                            .numeric => |v| try msgpack.Payload.strToPayload(v, encoding_allocator),
+                            .jsonb => |v| try msgpack.Payload.strToPayload(v, encoding_allocator),
+                            .array => |v| try msgpack.Payload.strToPayload(v, encoding_allocator),
+                            .bytea => |v| try msgpack.Payload.strToPayload(v, encoding_allocator),
+                            .null => msgpack.Payload{ .nil = {} },
                         };
 
                         try data_payload.mapPut(col_name, value_payload);
@@ -309,13 +354,16 @@ pub const BatchPublisher = struct {
             }
 
             // Write batch array
+            const encode_start = std.time.milliTimestamp();
             try packer.write(batch_array);
+            const encode_elapsed = std.time.milliTimestamp() - encode_start;
 
             // Get the encoded bytes
             const written = write_buffer.pos;
             const encoded = buffer[0..written];
 
             // Publish the batch with a composite message ID
+            const publish_start = std.time.milliTimestamp();
             const first_msg_id = self.events.items[0].msg_id;
             const last_msg_id = self.events.items[event_count - 1].msg_id;
             const batch_msg_id = try std.fmt.allocPrint(
@@ -335,13 +383,21 @@ pub const BatchPublisher = struct {
             defer self.allocator.free(batch_subject);
 
             try self.publisher.publish(batch_subject, encoded, batch_msg_id);
+            const publish_elapsed = std.time.milliTimestamp() - publish_start;
 
-            log.info("Published batch: {d} events, {d} bytes to {s}", .{
+            // Flush async publishes to actually send them to NATS
+            try self.publisher.flushAsync();
+
+            log.info("Published batch: {d} events, {d} bytes to {s} (encode: {d}ms, publish: {d}ms)", .{
                 event_count,
                 encoded.len,
                 batch_subject,
+                encode_elapsed,
+                publish_elapsed,
             });
         }
+
+        log.info("Cleaning up {d} events after successful flush", .{event_count});
 
         // Clean up events
         for (self.events.items) |*event| {
@@ -356,5 +412,10 @@ pub const BatchPublisher = struct {
         if (flush_elapsed > 5) {
             log.warn("Slow flush: {d}ms for {d} events", .{ flush_elapsed, event_count });
         }
+
+        // Store confirmed LSN after successful flush
+        self.last_confirmed_lsn = max_lsn;
+        log.debug("Flushed batch with max LSN: {x}", .{max_lsn});
+        return max_lsn;
     }
 };

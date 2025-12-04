@@ -35,6 +35,7 @@ pub const ReplicationSetup = struct {
 
         const check_result = try runQuery(conn, check_query);
         defer c.PQclear(check_result);
+        log.info("Checking for replication slot '{s}'...", .{slot_name});
 
         const exists = c.PQntuples(check_result) > 0;
 

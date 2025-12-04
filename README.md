@@ -18,6 +18,11 @@ If you need a new one, you assign a new HTTP port, replication slot and NATS str
 
 ## Architecture
 
+batch_publisher.zig: Return max LSN from flush operations
+bridge.zig: Only set pending_ack_lsn after successful NATS flush
+Optional: Add a callback mechanism so async flush can signal completion
+This guarantees at-least-once delivery to NATS, with the replication slot protecting against data loss between PG and NATS.
+
 - PostgreSQL setup:
 
 ```mermaid

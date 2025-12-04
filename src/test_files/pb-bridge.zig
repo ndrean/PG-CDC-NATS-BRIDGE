@@ -305,7 +305,6 @@ pub fn main() !void {
     const keepalive_interval_seconds: i64 = 30; // Send keepalive every 30 seconds
 
     // Status update batching to reduce PostgreSQL round trips
-    var pending_ack_lsn: u64 = 0; // LSN waiting to be acknowledged
     var messages_since_ack: u32 = 0; // Count messages since last ack
     var last_status_update_time = std.time.timestamp();
     const status_update_interval_seconds: i64 = 10; // Send status update every 10 seconds
@@ -417,7 +416,7 @@ pub fn main() !void {
                         );
 
                         // Add to batch publisher (TODO: add column data decoding for protobuf)
-                        try batch_pub.addEvent(subject, table_name, op_str, msg_id, null);
+                        try batch_pub.addEvent(subject, table_name, op_str, msg_id, null, wal_msg.wal_end);
                         cdc_events += 1;
                         metrics.incrementCdcEvents();
                         log.info("  → Published to NATS: {s} (msg_id: {s})", .{ subject, msg_id });
@@ -426,25 +425,28 @@ pub fn main() !void {
                     }
                 }
 
-                // Buffer acknowledgment instead of sending immediately
+                // Track the latest WAL position we've received
                 if (wal_msg.wal_end > 0) {
-                    pending_ack_lsn = wal_msg.wal_end;
                     messages_since_ack += 1;
                     metrics.updateLsn(wal_msg.wal_end);
                 }
 
+                // Get the last LSN confirmed by NATS (after successful flush)
+                const confirmed_lsn = batch_pub.getLastConfirmedLsn();
+
                 // Send buffered status update if we hit time or message threshold
+                // Only ACK up to the LSN that NATS has confirmed
                 const now = std.time.timestamp();
-                if (pending_ack_lsn > 0 and
+                if (confirmed_lsn > last_ack_lsn and
                     (messages_since_ack >= status_update_message_count or
                         now - last_status_update_time >= status_update_interval_seconds))
                 {
-                    try pg_stream.sendStatusUpdate(pending_ack_lsn);
-                    last_ack_lsn = pending_ack_lsn;
+                    try pg_stream.sendStatusUpdate(confirmed_lsn);
+                    log.debug("ACKed to PostgreSQL: LSN {x} (NATS confirmed)", .{confirmed_lsn});
+                    last_ack_lsn = confirmed_lsn;
                     messages_since_ack = 0;
                     last_status_update_time = now;
                     last_keepalive_time = now; // Reset keepalive timer
-                    log.debug("Sent buffered status update (LSN: {x}, buffered {} messages)", .{ pending_ack_lsn, messages_since_ack });
                 }
 
                 // Record processing time
@@ -455,14 +457,17 @@ pub fn main() !void {
                 // No message available - check if we need to send pending acks or keepalive
                 const now = std.time.timestamp();
 
+                // Get the last LSN confirmed by NATS
+                const confirmed_lsn = batch_pub.getLastConfirmedLsn();
+
                 // Flush pending status updates if time threshold reached
-                if (pending_ack_lsn > 0 and now - last_status_update_time >= status_update_interval_seconds) {
-                    try pg_stream.sendStatusUpdate(pending_ack_lsn);
-                    last_ack_lsn = pending_ack_lsn;
+                if (confirmed_lsn > last_ack_lsn and now - last_status_update_time >= status_update_interval_seconds) {
+                    try pg_stream.sendStatusUpdate(confirmed_lsn);
+                    log.debug("ACKed to PostgreSQL on idle: LSN {x} (NATS confirmed)", .{confirmed_lsn});
+                    last_ack_lsn = confirmed_lsn;
                     messages_since_ack = 0;
                     last_status_update_time = now;
                     last_keepalive_time = now;
-                    log.debug("Sent buffered status update on idle (LSN: {x})", .{pending_ack_lsn});
                 } else if (now - last_keepalive_time >= keepalive_interval_seconds) {
                     // Send keepalive status update to prevent timeout
                     if (last_ack_lsn > 0) {
@@ -474,7 +479,7 @@ pub fn main() !void {
 
                 // Check if batch needs time-based flush
                 if (batch_pub.shouldFlushByTime()) {
-                    try batch_pub.flush();
+                    _ = try batch_pub.flush();
                 }
 
                 // Flush NATS async publishes periodically
