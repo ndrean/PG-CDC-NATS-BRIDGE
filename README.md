@@ -734,3 +734,123 @@ This project uses:
 - nats.c (Apache 2.0)
 - pg.zig (MIT)
 - zig-msgpack (MIT)
+
+## SCSCP
+
+Atomic operations guarantee atomicity - the operation completes as a single, indivisible unit that can't be interrupted or observed in a partial state by other threads. This is more than just taking a snapshot. For example:
+const value = self.write_index.load(.monotonic);  // Atomic read
+This guarantees:
+Atomicity: The read happens as one operation (no torn reads on 64-bit values)
+Thread-safety: No data races even with concurrent access
+Memory ordering: Controls visibility of other memory operations (explained below)
+Memory Ordering: .monotonic vs .acquire vs .release
+Memory ordering controls when other threads see the effects of your operations. This is crucial for lock-free algorithms.
+.monotonic (Relaxed)
+Guarantees: Only the atomicity of THIS operation
+Does NOT guarantee: Any ordering with respect to other memory operations
+Use case: When you just need an atomic read/write but don't care about synchronization with other operations
+const current_write = self.write_index.load(.monotonic);
+// Just reading the index value atomically
+// No guarantees about seeing other thread's non-atomic writes
+.acquire (Acquire)
+Guarantees: All memory operations AFTER this acquire in your code will see the effects of operations that happened BEFORE the corresponding release in another thread
+Use case: Reading data that another thread published
+const current_write = self.write_index.load(.acquire);
+// Now I can safely read buffer[i] because I'm guaranteed to see
+// the data that the producer wrote BEFORE it did release store
+.release (Release)
+Guarantees: All memory operations BEFORE this release in your code will be visible to threads that do a corresponding acquire
+Use case: Publishing data for another thread to read
+self.buffer[index] = item;  // Write data first
+self.write_index.store(next_index, .release);
+// Release ensures buffer write is visible before index update
+.seq_cst (Sequentially Consistent)
+Guarantees: Strongest ordering - total global order of all seq_cst operations
+Use case: When you need the strictest guarantees (but it's slower)
+
+pub fn push(self: *Self, item: T) error{QueueFull}!void {
+    const current_write = self.write_index.load(.monotonic);  // [1]
+    const current_read = self.read_index.load(.acquire);      // [2]
+    
+    // Check if full...
+    
+    self.buffer[current_write] = item;  // [3] Write data
+    
+    self.write_index.store(next_write, .release);  // [4] Publish
+}
+Line [1]: .monotonic - We just need our own current write position, no synchronization needed
+Line [2]: .acquire - We need to see if consumer freed up space (see the latest read_index from consumer's .release)
+Line [3]: Normal write to buffer
+Line [4]: .release - Ensures data write [3] is visible before index update. Consumer will see this with .acquire
+Consumer (pop):
+pub fn pop(self: *Self) ?T {
+    const current_read = self.read_index.load(.monotonic);   // [1]
+    const current_write = self.write_index.load(.acquire);   // [2]
+    
+    // Check if empty...
+    
+    const item = self.buffer[current_read];  // [3] Read data
+    
+    self.read_index.store(next_read, .release);  // [4] Free slot
+    return item;
+}
+Line [1]: .monotonic - Just need our own read position
+Line [2]: .acquire - This synchronizes with producer's .release at [4]. Now we're guaranteed to see the data written at [3]
+Line [3]: Read the data (safe because of acquire/release pairing)
+Line [4]: .release - Tell producer this slot is free (producer will see this with its .acquire)
+The Acquire/Release Contract
+Think of it as a happens-before relationship:
+Producer Thread:              Consumer Thread:
+------------------           ------------------
+buffer[5] = data             
+write_index.store(6, .release)  →  write_index.load(.acquire)
+                                   item = buffer[5]  ✓ sees data
+Without proper ordering, the consumer might see the updated write_index but stale data in the buffer due to CPU reordering or cache coherency delays.
+Why Not Always Use .seq_cst?
+.seq_cst is the safest but slowest. For SPSC queues, we can use cheaper orderings because:
+Only 2 threads (producer/consumer)
+Clear ownership model (each index owned by one thread)
+Acquire/release is sufficient for the synchronization we need
+Your SPSC queue uses the optimal memory orderings for maximum performance while maintaining correctness!The Two-Stage Architecture
+Stage 1: Lock-Free Queue (TRUE Concurrency)
+// In AsyncBatchPublisher struct (line 18)
+event_queue: SPSCQueue(batch_publisher.CDCEvent),
+Main thread (producer) calls addEvent() which:
+Copies metadata strings to heap
+Takes ownership of columns ArrayList
+Pushes CDCEvent to lock-free SPSC queue (line 119)
+Flush thread (consumer) in flushLoop():
+Pops CDCEvent from lock-free SPSC queue (line 180)
+Transfers ownership to its own private ArrayList
+Stage 2: Private ArrayList (NO Concurrency)
+// In flushLoop() - line 167
+var batch = std.ArrayList(batch_publisher.CDCEvent){};
+This ArrayList is local to the flush thread only. The main thread never touches it.
+Where TRUE Concurrency Happens
+The concurrent read/write happens at the SPSC queue boundary:
+Main thread writes to event_queue via atomic write_index (spsc_queue.zig:80)
+Flush thread reads from event_queue via atomic read_index (spsc_queue.zig:104)
+These operations happen simultaneously:
+While flush thread is draining events at index 100-199
+Main thread is pushing new events at index 200-299
+No locks, just atomic index updates with memory ordering
+Why This Design?
+The SPSC queue provides:
+Wait-free operations: Push/pop never block
+Cache-friendly: Separate cache lines for indices (line 30-31)
+Backpressure: Queue full → main thread yields (line 129)
+Zero contention on ArrayList: Each thread owns its own
+What Would Happen Without Lock-Free Queue?
+If we used a shared mutex-protected ArrayList:
+// BAD: Shared ArrayList with mutex
+var shared_batch: std.ArrayList(CDCEvent) = ...;
+var mutex: std.Thread.Mutex = ...;
+
+// Main thread blocks during flush!
+mutex.lock();
+try shared_batch.append(event);
+mutex.unlock();
+This would cause:
+Main thread blocks while flush thread holds mutex
+Flush thread blocks while main thread adds events
+Terrible throughput under load

@@ -163,10 +163,18 @@ pub const AsyncBatchPublisher = struct {
         var batches_processed: usize = 0;
         var last_flush_time = std.time.milliTimestamp();
 
-        while (!self.should_stop.load(.seq_cst)) {
-            // Create a fresh batch for each flush cycle
-            var batch = std.ArrayList(batch_publisher.CDCEvent){};
+        // Persistent batch that accumulates events across iterations
+        var batch = std.ArrayList(batch_publisher.CDCEvent){};
+        defer {
+            // Clean up on thread exit
+            for (batch.items) |*event| {
+                var mut_event = event.*;
+                mut_event.deinit(self.allocator);
+            }
+            batch.deinit(self.allocator);
+        }
 
+        while (!self.should_stop.load(.seq_cst)) {
             // Drain up to max_events from the queue
             while (batch.items.len < self.config.max_events) {
                 const event = self.event_queue.pop() orelse break;
@@ -191,8 +199,12 @@ pub const AsyncBatchPublisher = struct {
                 batches_processed += 1;
                 log.info("Flush thread processing batch #{d} with {d} events", .{ batches_processed, batch.items.len });
 
-                // flushBatch takes ownership and cleans up
-                self.flushBatch(batch) catch |err| {
+                // flushBatch takes ownership of the batch
+                // We need to transfer ownership and create a new batch
+                const batch_to_flush = batch;
+                batch = std.ArrayList(batch_publisher.CDCEvent){}; // New empty batch
+
+                self.flushBatch(batch_to_flush) catch |err| {
                     log.err("Failed to flush batch: {}", .{err});
                 };
 
@@ -201,12 +213,8 @@ pub const AsyncBatchPublisher = struct {
                 // No events available, sleep briefly to avoid busy-waiting
                 std.Thread.sleep(1 * std.time.ns_per_ms);
             } else {
-                // Have events but timeout not reached, clean up and retry
-                for (batch.items) |*event| {
-                    var mut_event = event.*;
-                    mut_event.deinit(self.allocator);
-                }
-                batch.deinit(self.allocator);
+                // Have events but timeout not reached - keep them and sleep briefly
+                std.Thread.sleep(1 * std.time.ns_per_ms);
             }
         }
 

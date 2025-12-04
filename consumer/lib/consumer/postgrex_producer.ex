@@ -55,18 +55,6 @@ defmodule PgProducer do
         }
       end
 
-    # for idx <- 1..nb do
-    #   values =
-    #     for j <- 1..nb do
-    #       %{
-    #         name: "User-#{i}-#{idx}-#{j}",
-    #         email: "user-#{i}-#{idx}-#{j}@example.com"
-    #       }
-    #     end
-
-    #   Producer.Repo.insert_all(name, values)
-    # end
-
     Producer.Repo.insert_all(name, values)
 
     # %Postgrex.Result{} =
@@ -171,4 +159,4 @@ defmodule PgProducer do
 end
 
 # Stream.interval(1) |> Stream.take(1_000) |> Task.async_stream(fn _ -> PgProducer.run(100, Enum.random(["users", "orders"])) end, ordered: false) |> Stream.run()
-# Stream.interval(1) |> Stream.take(1_000) |> Task.async_stream(fn _ -> PgProducer.run(100, "users") end, ordered: false) |> Stream.run()
+# Stream.interval(1) |> Stream.take(10_000) |> Task.async_stream(fn _ -> PgProducer.run(140, "users") end, ordered: false) |> Stream.run()

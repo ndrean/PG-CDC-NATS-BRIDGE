@@ -21,7 +21,6 @@ var should_stop = std.atomic.Value(bool).init(false);
 
 /// Helper to process and publish a CDC event (INSERT/UPDATE/DELETE)
 fn processCdcEvent(
-    arena_allocator: std.mem.Allocator,
     main_allocator: std.mem.Allocator,
     rel: pgoutput.RelationMessage,
     tuple_data: pgoutput.TupleData,
@@ -58,14 +57,15 @@ fn processCdcEvent(
         decoded_values.deinit(main_allocator);
     }
 
-    // Extract ID value for logging (if present)
+    // Extract ID value for logging (if present) - use stack buffer
+    var id_buf: [64]u8 = undefined;
     const id_str = blk: {
         for (decoded_values.items) |column| {
             if (std.mem.eql(u8, column.name, "id")) {
                 break :blk switch (column.value) {
-                    .int32 => |v| try std.fmt.allocPrint(arena_allocator, "{d}", .{v}),
-                    .int64 => |v| try std.fmt.allocPrint(arena_allocator, "{d}", .{v}),
-                    .text => |v| try std.fmt.allocPrint(arena_allocator, "{s}", .{v}),
+                    .int32 => |v| std.fmt.bufPrint(&id_buf, "{d}", .{v}) catch "?",
+                    .int64 => |v| std.fmt.bufPrint(&id_buf, "{d}", .{v}) catch "?",
+                    .text => |v| if (v.len <= id_buf.len) v else "?",
                     else => "?",
                 };
             }
@@ -73,20 +73,22 @@ fn processCdcEvent(
         break :blk null;
     };
 
-    // Convert operation to lowercase for NATS subject
-    const operation_lower = try std.ascii.allocLowerString(arena_allocator, operation);
+    // Convert operation to lowercase for NATS subject - use stack buffer
+    var operation_lower_buf: [16]u8 = undefined;
+    const operation_lower = std.ascii.lowerString(&operation_lower_buf, operation);
 
-    // Create NATS subject
-    const subject = try std.fmt.allocPrintSentinel(
-        arena_allocator,
+    // Create NATS subject - use stack buffer
+    var subject_buf: [128]u8 = undefined;
+    const subject = try std.fmt.bufPrintZ(
+        &subject_buf,
         "{s}.{s}.{s}",
         .{ subject_prefix, rel.name, operation_lower },
-        0,
     );
 
-    // Generate message ID from WAL LSN for idempotent delivery
-    const msg_id = try std.fmt.allocPrint(
-        arena_allocator,
+    // Generate message ID from WAL LSN for idempotent delivery - use stack buffer
+    var msg_id_buf: [128]u8 = undefined;
+    const msg_id = try std.fmt.bufPrint(
+        &msg_id_buf,
         "{x}-{s}-{s}",
         .{ wal_end, rel.name, operation_lower },
     );
@@ -301,8 +303,8 @@ pub fn main() !void {
     // Status update batching to reduce PostgreSQL round trips
     var messages_since_ack: u32 = 0; // Count messages since last ack
     var last_status_update_time = std.time.timestamp();
-    const status_update_interval_seconds: i64 = 10; // Send status update every 10 seconds
-    const status_update_message_count: u32 = 1000; // Or after 1000 messages
+    const status_update_interval_seconds: i64 = 1; // Send status update every 1 second (reduced for visibility)
+    const status_update_message_count: u32 = 100; // Or after 100 messages (reduced for visibility)
 
     // NATS async publish flushing
     var last_nats_flush_time = std.time.timestamp();
@@ -367,9 +369,8 @@ pub fn main() !void {
                     // Parse messages with arena allocator
                     // Relations use main allocator since they persist in the map
                     var parser = pgoutput.Parser.init(arena_allocator, wal_msg.payload);
-                    if (parser.parse()) |parsed_msg| {
-                        const pg_msg = parsed_msg;
-                        // No manual deinit needed - arena.deinit() handles everything
+                    if (parser.parse()) |pg_msg| {
+                        // arena.deinit() handles everything
 
                         switch (pg_msg) {
                             .relation => |rel| {
@@ -391,7 +392,6 @@ pub fn main() !void {
                             .insert => |ins| {
                                 if (relation_map.get(ins.relation_id)) |rel| {
                                     try processCdcEvent(
-                                        arena_allocator,
                                         allocator,
                                         rel,
                                         ins.tuple_data,
@@ -407,7 +407,6 @@ pub fn main() !void {
                             .update => |upd| {
                                 if (relation_map.get(upd.relation_id)) |rel| {
                                     try processCdcEvent(
-                                        arena_allocator,
                                         allocator,
                                         rel,
                                         upd.new_tuple,
@@ -423,7 +422,6 @@ pub fn main() !void {
                             .delete => |del| {
                                 if (relation_map.get(del.relation_id)) |rel| {
                                     try processCdcEvent(
-                                        arena_allocator,
                                         allocator,
                                         rel,
                                         del.old_tuple,
@@ -462,6 +460,11 @@ pub fn main() !void {
                 // Get the last LSN confirmed by NATS (after successful flush)
                 const confirmed_lsn = batch_pub.getLastConfirmedLsn();
 
+                // Debug: Log confirmed_lsn vs last_ack_lsn
+                if (messages_since_ack > 0 and messages_since_ack % 10 == 0) {
+                    log.debug("Checking ACK: confirmed_lsn={x}, last_ack_lsn={x}, messages={d}", .{ confirmed_lsn, last_ack_lsn, messages_since_ack });
+                }
+
                 // Send buffered status update if we hit time or message threshold
                 // Only ACK up to the LSN that NATS has confirmed
                 const now = std.time.timestamp();
@@ -470,7 +473,7 @@ pub fn main() !void {
                         now - last_status_update_time >= status_update_interval_seconds))
                 {
                     try pg_stream.sendStatusUpdate(confirmed_lsn);
-                    log.debug("ACKed to PostgreSQL: LSN {x} (NATS confirmed)", .{confirmed_lsn});
+                    log.info("✓ ACKed to PostgreSQL: LSN {x} (NATS confirmed, {d} messages)", .{ confirmed_lsn, messages_since_ack });
                     last_ack_lsn = confirmed_lsn;
                     messages_since_ack = 0;
                     last_status_update_time = now;
@@ -491,7 +494,7 @@ pub fn main() !void {
                 // Flush pending status updates if time threshold reached
                 if (confirmed_lsn > last_ack_lsn and now - last_status_update_time >= status_update_interval_seconds) {
                     try pg_stream.sendStatusUpdate(confirmed_lsn);
-                    log.debug("ACKed to PostgreSQL on idle: LSN {x} (NATS confirmed)", .{confirmed_lsn});
+                    log.info("✓ ACKed to PostgreSQL: LSN {x} (NATS confirmed)", .{confirmed_lsn});
                     last_ack_lsn = confirmed_lsn;
                     messages_since_ack = 0;
                     last_status_update_time = now;
