@@ -18,8 +18,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      nats-server:
-        condition: service_started
+      nats-init:
+        condition: service_completed_successfully
     environment:
       POSTGRES_HOST: postgres
       NATS_HOST: nats-server
@@ -34,6 +34,11 @@ services:
     extends:
       file: docker-compose.yml
       service: nats-server
+
+  nats-init:
+    extends:
+      file: docker-compose.yml
+      service: nats-init
 
 volumes:
   postgres-data:

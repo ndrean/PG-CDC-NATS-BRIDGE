@@ -316,10 +316,41 @@ pub const Publisher = struct {
     }
 };
 
+/// Ensure a JetStream stream exists (check-or-fail-fast)
+///
+/// This validates that the stream exists and is accessible.
+/// Use this when infrastructure (e.g., nats-init container) creates streams.
+/// The bridge should only verify prerequisites, not create them.
+pub fn ensureStream(js: *c.jsCtx, allocator: std.mem.Allocator, stream_name: [:0]const u8) !void {
+    _ = allocator;
+    log.info("Checking JetStream stream '{s}' exists...", .{stream_name});
+
+    var js_err: c.jsErrCode = 0;
+    var stream_info: ?*c.jsStreamInfo = null;
+
+    // Try to get existing stream info
+    const status = c.js_GetStreamInfo(&stream_info, js, stream_name.ptr, null, &js_err);
+
+    if (status == c.NATS_OK) {
+        log.info("✓ Stream '{s}' found and accessible", .{stream_name});
+        c.jsStreamInfo_Destroy(stream_info);
+        return;
+    }
+
+    // Stream doesn't exist or not accessible
+    const status_text = c.natsStatus_GetText(status);
+    log.err("🔴 Stream '{s}' not found or inaccessible: {s}", .{ stream_name, status_text });
+    log.err("   Ensure the stream is created by infrastructure (e.g., nats-init container)", .{});
+    return error.StreamNotFound;
+}
+
 /// Create or update a JetStream stream
 ///
 /// This is a standalone function to keep stream management separate from the Publisher.
 /// Call this after connecting to configure your streams.
+///
+/// NOTE: Prefer using ensureStream() for production deployments where infrastructure
+/// (e.g., nats-init) creates streams. This function is useful for development/testing.
 pub fn createStream(js: *c.jsCtx, allocator: std.mem.Allocator, config: StreamConfig) !void {
     log.info("Creating JetStream stream '{s}'...", .{config.name});
 

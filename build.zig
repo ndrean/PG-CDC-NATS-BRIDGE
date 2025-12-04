@@ -1,5 +1,5 @@
 const std = @import("std");
-const protobuf = @import("protobuf");
+// const protobuf = @import("protobuf"); // TODO: Maybe switch from MessagePack to protobuf later
 
 /// Build nats.c library using CMake
 fn buildNats(b: *std.Build) *std.Build.Step {
@@ -102,10 +102,10 @@ pub fn build(b: *std.Build) void {
     const nats_build_step = buildNats(b);
 
     // Protobuf code generation
-    const protobuf_dep = b.dependency("protobuf", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    // const protobuf_dep = b.dependency("protobuf", .{
+    //     .target = target,
+    //     .optimize = optimize,
+    // });
 
     // TODO: Update gen-proto step for new protobuf API
     // `zig build gen-proto` step to generate Zig files from .proto definitions
@@ -151,7 +151,7 @@ pub fn build(b: *std.Build) void {
     exe.addIncludePath(b.path("libs/nats-install/include"));
     exe.addLibraryPath(b.path("libs/nats-install/lib"));
     exe.addObjectFile(b.path("libs/nats-install/lib/libnats_static.a"));
-    exe.root_module.addImport("protobuf", protobuf_dep.module("protobuf"));
+    // exe.root_module.addImport("protobuf", protobuf_dep.module("protobuf"));
 
     // Link vendored libpq
     linkLibpq(exe, b);
@@ -159,26 +159,26 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     // pb-bridge executable (using decoderbufs/protobuf instead of pgoutput)
-    const pb_bridge_exe = b.addExecutable(.{
-        .name = "pb-bridge",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/pb-bridge.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "bridge", .module = mod },
-                .{ .name = "msgpack", .module = msgpack.module("msgpack") },
-                .{ .name = "protobuf", .module = protobuf_dep.module("protobuf") },
-            },
-        }),
-    });
+    // const pb_bridge_exe = b.addExecutable(.{
+    //     .name = "pb-bridge",
+    //     .root_module = b.createModule(.{
+    //         .root_source_file = b.path("src/pb-bridge.zig"),
+    //         .target = target,
+    //         .optimize = optimize,
+    //         .imports = &.{
+    //             .{ .name = "bridge", .module = mod },
+    //             .{ .name = "msgpack", .module = msgpack.module("msgpack") },
+    //             .{ .name = "protobuf", .module = protobuf_dep.module("protobuf") },
+    //         },
+    //     }),
+    // });
 
-    pb_bridge_exe.step.dependOn(nats_build_step);
-    pb_bridge_exe.addIncludePath(b.path("libs/nats-install/include"));
-    pb_bridge_exe.addLibraryPath(b.path("libs/nats-install/lib"));
-    pb_bridge_exe.addObjectFile(b.path("libs/nats-install/lib/libnats_static.a"));
-    linkLibpq(pb_bridge_exe, b);
-    b.installArtifact(pb_bridge_exe);
+    // pb_bridge_exe.step.dependOn(nats_build_step);
+    // pb_bridge_exe.addIncludePath(b.path("libs/nats-install/include"));
+    // pb_bridge_exe.addLibraryPath(b.path("libs/nats-install/lib"));
+    // pb_bridge_exe.addObjectFile(b.path("libs/nats-install/lib/libnats_static.a"));
+    // linkLibpq(pb_bridge_exe, b);
+    // b.installArtifact(pb_bridge_exe);
 
     // A top-level step to build and run the application with `zig build run`
     const run_step = b.step("run", "Run the app");
@@ -191,14 +191,14 @@ pub fn build(b: *std.Build) void {
     }
 
     // Run step for pb-bridge
-    const run_pb_step = b.step("run-pb", "Run pb-bridge (protobuf version)");
-    const run_pb_cmd = b.addRunArtifact(pb_bridge_exe);
-    run_pb_step.dependOn(&run_pb_cmd.step);
-    run_pb_cmd.step.dependOn(b.getInstallStep());
+    // const run_pb_step = b.step("run-pb", "Run pb-bridge (protobuf version)");
+    // const run_pb_cmd = b.addRunArtifact(pb_bridge_exe);
+    // run_pb_step.dependOn(&run_pb_cmd.step);
+    // run_pb_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
-        run_pb_cmd.addArgs(args);
-    }
+    // if (b.args) |args| {
+    //     run_pb_cmd.addArgs(args);
+    // }
 
     // ===== Test executables =====
     // Creates an executable that will run `test` blocks from the module.

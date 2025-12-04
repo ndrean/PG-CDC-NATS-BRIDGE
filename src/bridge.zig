@@ -6,7 +6,7 @@ const pgoutput = @import("pgoutput.zig");
 const nats_publisher = @import("nats_publisher.zig");
 const batch_publisher = @import("batch_publisher.zig");
 const async_batch_publisher = @import("async_batch_publisher.zig");
-const async_direct_publisher = @import("async_direct_publisher.zig");
+// const async_direct_publisher = @import("async_direct_publisher.zig");
 const replication_setup = @import("replication_setup.zig");
 const msgpack = @import("msgpack");
 const http_server = @import("http_server.zig");
@@ -206,13 +206,21 @@ pub fn main() !void {
     defer publisher.deinit();
     try publisher.connect();
 
-    // Create CDC stream with configurable name
+    // Ensure CDC stream exists (created by infrastructure)
     const stream_name_z = try allocator.dupeZ(u8, parsed_args.stream_name);
     defer allocator.free(stream_name_z);
 
-    // Generate subject pattern from stream name to avoid conflicts
+    // Verify stream exists and is accessible (fail-fast if not)
+    try nats_publisher.ensureStream(
+        publisher.js.?,
+        allocator,
+        stream_name_z,
+    );
+    log.info("✅ NATS JetStream stream verified\n", .{});
+
+    // Generate subject pattern from stream name for publishing
     // Convert stream name to lowercase and use as subject prefix
-    // Example: CDC_BRIDGE -> "cdc_bridge.>" or CDC_RT -> "cdc_rt.>"
+    // Example: CDC -> "cdc.>" subjects
     var subject_buf: [128]u8 = undefined;
     const subject_str = try std.fmt.bufPrint(&subject_buf, "{s}.>", .{parsed_args.stream_name});
 
@@ -225,20 +233,6 @@ pub fn main() !void {
         }
         break :blk lower_subject_buf[0..subject_str.len];
     };
-
-    const subject_z = try allocator.dupeZ(u8, lower_subject);
-    defer allocator.free(subject_z);
-
-    const stream_config = nats_publisher.StreamConfig{
-        .name = stream_name_z,
-        .subjects = &.{subject_z},
-    };
-    try nats_publisher.createStream(
-        publisher.js.?,
-        allocator,
-        stream_config,
-    );
-    log.info("✅ NATS JetStream connected\n", .{});
 
     // Make publisher available to HTTP server for stream management
     http_srv.nats_publisher = &publisher;

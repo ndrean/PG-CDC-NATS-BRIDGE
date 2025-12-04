@@ -36,12 +36,34 @@ services:
     ports:
       - "4222:4222" # Client connections
       - "8222:8222" # HTTP monitoring
-    command: -js  -sd /data
+    command: -js  -sd /data -m 8222
     volumes:
       - nats-data:/data
     restart: unless-stopped
     networks:
       - cdc-bridge
+
+  nats-init:
+    image: natsio/nats-box:latest
+    container_name: nats-init
+    networks:
+      - cdc-bridge
+    depends_on:
+      - nats-server
+    command:
+      - sh
+      - -c
+      - |
+        echo 'Waiting for NATS server...'
+        until nats server check connection --server=nats://nats-server:4222 2>/dev/null; do
+          echo 'NATS not ready yet, retrying in 1s...'
+          sleep 1
+        done
+        echo 'NATS server is ready!'
+        echo 'Creating NATS JetStream stream: CDC'
+        nats stream add CDC --server=nats://nats-server:4222 --subjects='cdc.>' --storage=file --retention=limits --max-age=1m --max-msgs=1000000 --max-bytes=1G --replicas=1 --defaults
+        echo 'Stream CDC created successfully'
+    restart: "no"
 
 volumes:
   postgres-data:

@@ -1,5 +1,7 @@
 //! Parser for PostgreSQL logical replication protocol
 const std = @import("std");
+const array_mod = @import("array.zig");
+const numeric_mod = @import("numeric.zig");
 
 pub const log = std.log.scoped(.pgoutput);
 
@@ -113,9 +115,8 @@ pub fn decodeBinColumnData(
     type_id: u32,
     raw_bytes: []const u8,
 ) !DecodedValue {
-    const array_mod = @import("array.zig");
-    const numeric_mod = @import("numeric.zig");
-    _ = @import("jsonb.zig"); // TODO: Use when implementing JSONB binary parsing
+
+    // _ = @import("jsonb.zig"); // TODO: Use when implementing JSONB binary parsing
 
     const oid: PgOid = @enumFromInt(type_id);
 
@@ -178,11 +179,7 @@ pub fn decodeBinColumnData(
             const micros = @abs(@mod(microseconds, 1_000_000));
 
             // Format as Unix timestamp with microseconds
-            const ts_str = try std.fmt.allocPrint(
-                allocator,
-                "{d}.{d:0>6}",
-                .{ unix_seconds, micros }
-            );
+            const ts_str = try std.fmt.allocPrint(allocator, "{d}.{d:0>6}", .{ unix_seconds, micros });
             return .{ .text = ts_str };
         },
 
