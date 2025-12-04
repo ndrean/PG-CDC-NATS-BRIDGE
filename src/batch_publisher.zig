@@ -21,7 +21,7 @@ pub const CDCEvent = struct {
     table: []const u8,
     operation: []const u8,
     msg_id: []const u8,
-    data: ?std.StringHashMap(pgoutput.DecodedValue),
+    data: ?std.ArrayList(pgoutput.Column),
     lsn: u64, // WAL LSN for this event
 
     pub fn deinit(self: *CDCEvent, allocator: std.mem.Allocator) void {
@@ -30,22 +30,21 @@ pub const CDCEvent = struct {
         allocator.free(self.operation);
         allocator.free(self.msg_id);
 
-        if (self.data) |*data_map| {
-            // Free all keys and slice-based values in the hashmap
-            var it = data_map.iterator();
-            while (it.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                // Free slice-based values (text, numeric, array, jsonb, bytea)
-                switch (entry.value_ptr.*) {
+        if (self.data) |*columns| {
+            // Free slice-based values in columns
+            for (columns.items) |column| {
+                // Note: column.name is NOT owned (points to RelationMessage.columns)
+                // Only free the value if it's a slice type
+                switch (column.value) {
                     .text => |txt| allocator.free(txt),
                     .numeric => |num| allocator.free(num),
                     .array => |arr| allocator.free(arr),
                     .jsonb => |jsn| allocator.free(jsn),
                     .bytea => |byt| allocator.free(byt),
-                    else => {}, // int32, int64, float64, boolean don't need freeing
+                    else => {}, // int32, int64, float64, boolean, null don't need freeing
                 }
             }
-            data_map.deinit();
+            columns.deinit(allocator);
         }
     }
 };
@@ -98,10 +97,10 @@ pub const BatchPublisher = struct {
         table: []const u8,
         operation: []const u8,
         msg_id: []const u8,
-        data: ?std.StringHashMap(pgoutput.DecodedValue),
+        data: ?std.ArrayList(pgoutput.Column),
         lsn: u64,
     ) !void {
-        // Make owned copies of the data
+        // Make owned copies of the metadata strings
         const owned_subject = try self.allocator.dupeZ(u8, subject);
         errdefer self.allocator.free(owned_subject);
 
@@ -114,34 +113,13 @@ pub const BatchPublisher = struct {
         const owned_msg_id = try self.allocator.dupe(u8, msg_id);
         errdefer self.allocator.free(owned_msg_id);
 
-        // Clone the data hashmap with owned keys and owned text values
-        var owned_data: ?std.StringHashMap(pgoutput.DecodedValue) = null;
-        if (data) |data_map| {
-            owned_data = std.StringHashMap(pgoutput.DecodedValue).init(self.allocator);
-            var it = data_map.iterator();
-            while (it.next()) |entry| {
-                const owned_key = try self.allocator.dupe(u8, entry.key_ptr.*);
-
-                // Deep copy the value, especially text-based fields (slices)
-                const owned_value = switch (entry.value_ptr.*) {
-                    .text => |txt| pgoutput.DecodedValue{ .text = try self.allocator.dupe(u8, txt) },
-                    .numeric => |num| pgoutput.DecodedValue{ .numeric = try self.allocator.dupe(u8, num) },
-                    .array => |arr| pgoutput.DecodedValue{ .array = try self.allocator.dupe(u8, arr) },
-                    .jsonb => |jsn| pgoutput.DecodedValue{ .jsonb = try self.allocator.dupe(u8, jsn) },
-                    .bytea => |byt| pgoutput.DecodedValue{ .bytea = try self.allocator.dupe(u8, byt) },
-                    else => entry.value_ptr.*, // int32, int64, float64, boolean are copied by value
-                };
-
-                try owned_data.?.put(owned_key, owned_value);
-            }
-        }
-
+        // Transfer ownership of columns ArrayList (zero-copy optimization)
         const event = CDCEvent{
             .subject = owned_subject,
             .table = owned_table,
             .operation = owned_operation,
             .msg_id = owned_msg_id,
-            .data = owned_data,
+            .data = data,
             .lsn = lsn,
         };
 
@@ -246,29 +224,22 @@ pub const BatchPublisher = struct {
             try event_map.mapPut("msg_id", try msgpack.Payload.strToPayload(event.msg_id, self.allocator));
 
             // Add column data if present
-            if (event.data) |data_map| {
-                log.debug("Single event has {d} columns", .{data_map.count()});
+            if (event.data) |columns| {
+                log.debug("Single event has {d} columns", .{columns.items.len});
                 var data_payload = msgpack.Payload.mapPayload(self.allocator);
                 // Don't defer - needs to stay alive until packer.write() completes
 
-                var it = data_map.iterator();
-                while (it.next()) |entry| {
-                    const col_name = entry.key_ptr.*;
-                    const value = entry.value_ptr.*;
-
-                    const value_payload = switch (value) {
+                for (columns.items) |column| {
+                    const value_payload = switch (column.value) {
                         .int32 => |v| msgpack.Payload{ .int = @intCast(v) },
                         .int64 => |v| msgpack.Payload{ .int = v },
                         .float64 => |v| msgpack.Payload{ .float = v },
                         .boolean => |v| msgpack.Payload{ .bool = v },
                         .text, .bytea, .array, .jsonb, .numeric => |v| try msgpack.Payload.strToPayload(v, self.allocator),
-                        else => {
-                            log.err("Unsupported data type in single event publishing", .{});
-                            return error.UnsupportedDataType;
-                        },
+                        .null => msgpack.Payload{ .nil = {} },
                     };
 
-                    try data_payload.mapPut(col_name, value_payload);
+                    try data_payload.mapPut(column.name, value_payload);
                 }
 
                 try event_map.mapPut("data", data_payload);
@@ -323,15 +294,11 @@ pub const BatchPublisher = struct {
                 try event_map.mapPut("msg_id", try msgpack.Payload.strToPayload(event.msg_id, encoding_allocator));
 
                 // Add column data if present
-                if (event.data) |data_map| {
+                if (event.data) |columns| {
                     var data_payload = msgpack.Payload.mapPayload(encoding_allocator);
 
-                    var it = data_map.iterator();
-                    while (it.next()) |entry| {
-                        const col_name = entry.key_ptr.*;
-                        const value = entry.value_ptr.*;
-
-                        const value_payload = switch (value) {
+                    for (columns.items) |column| {
+                        const value_payload = switch (column.value) {
                             .int32 => |v| msgpack.Payload{ .int = @intCast(v) },
                             .int64 => |v| msgpack.Payload{ .int = v },
                             .float64 => |v| msgpack.Payload{ .float = v },
@@ -344,7 +311,7 @@ pub const BatchPublisher = struct {
                             .null => msgpack.Payload{ .nil = {} },
                         };
 
-                        try data_payload.mapPut(col_name, value_payload);
+                        try data_payload.mapPut(column.name, value_payload);
                     }
 
                     try event_map.mapPut("data", data_payload);

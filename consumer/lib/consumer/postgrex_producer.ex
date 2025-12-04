@@ -171,4 +171,4 @@ defmodule PgProducer do
 end
 
 # Stream.interval(1) |> Stream.take(1_000) |> Task.async_stream(fn _ -> PgProducer.run(100, Enum.random(["users", "orders"])) end, ordered: false) |> Stream.run()
-# Stream.interval(1) |> Stream.take(5_000) |> Task.async_stream(fn _ -> PgProducer.run(100, "users") end, ordered: false) |> Stream.run()
+# Stream.interval(1) |> Stream.take(1_000) |> Task.async_stream(fn _ -> PgProducer.run(100, "users") end, ordered: false) |> Stream.run()

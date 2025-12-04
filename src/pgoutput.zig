@@ -5,6 +5,11 @@ const numeric_mod = @import("numeric.zig");
 
 pub const log = std.log.scoped(.pgoutput);
 
+/// Helper: Check if a year is a leap year
+inline fn isLeapYear(year: i32) bool {
+    return (@rem(year, 4) == 0 and @rem(year, 100) != 0) or (@rem(year, 400) == 0);
+}
+
 /// pgoutput protocol parser
 ///
 /// Parses PostgreSQL logical replication binary messages
@@ -105,6 +110,13 @@ pub const DecodedValue = union(enum) {
     bytea: []const u8, // BYTEA - raw bytes or hex/base64 encoded
 };
 
+/// Decoded column (name + value pair)
+/// Used instead of HashMap for better performance - we only iterate, never lookup by key
+pub const Column = struct {
+    name: []const u8,
+    value: DecodedValue,
+};
+
 /// Decodes the raw bytes based on the PostgreSQL type OID (BINARY format).
 ///
 /// This version handles binary-encoded data from PostgreSQL when using
@@ -162,32 +174,118 @@ pub fn decodeBinColumnData(
         // --- Date/Time Types (Binary format) ---
         .DATE => {
             if (raw_bytes.len != 4) return error.InvalidDataLength;
-            const days = std.mem.readInt(i32, raw_bytes[0..4], .big);
-            // PostgreSQL epoch: 2000-01-01, convert to text
-            const date_str = try std.fmt.allocPrint(allocator, "2000-01-01 + {d} days", .{days});
-            return .{ .text = date_str };
+            const pg_days = std.mem.readInt(i32, raw_bytes[0..4], .big);
+
+            // PostgreSQL epoch: 2000-01-01
+            // Convert to Unix timestamp then to date components
+            const PG_EPOCH_DAYS: i64 = 10957; // Days between 1970-01-01 and 2000-01-01
+            const total_unix_days = @as(i64, @intCast(pg_days)) + PG_EPOCH_DAYS;
+
+            // Simple date calculation (accounts for leap years)
+            var days = total_unix_days;
+            var year: i32 = 1970;
+
+            // Count years
+            while (true) {
+                const days_in_year: i64 = if (isLeapYear(year)) 366 else 365;
+                if (days < days_in_year) break;
+                days -= days_in_year;
+                year += 1;
+            }
+
+            // Count months
+            const is_leap = isLeapYear(year);
+            const month_days = [12]i32{ 31, if (is_leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+            var month: i32 = 1;
+            for (month_days) |month_len| {
+                if (days < month_len) break;
+                days -= month_len;
+                month += 1;
+            }
+            const day: i32 = @intCast(days + 1);
+
+            // Format as YYYY-MM-DD (always 10 chars)
+            var buf: [16]u8 = undefined;
+            _ = try std.fmt.bufPrint(
+                &buf,
+                "{d:0>4}-{d:0>2}-{d:0>2}",
+                .{ @as(u32, @intCast(year)), @as(u32, @intCast(month)), @as(u32, @intCast(day)) },
+            );
+
+            return .{ .text = try allocator.dupe(u8, buf[0..10]) };
         },
 
+        // ISO 8601 format: 2025-10-26T10:00:00.000000Z
         .TIMESTAMP, .TIMESTAMPTZ => {
             // Both use identical binary format: 8 bytes of microseconds since PG epoch
             // TIMESTAMPTZ is timezone-aware, TIMESTAMP is not, but encoding is the same
             if (raw_bytes.len != 8) return error.InvalidDataLength;
             const microseconds = std.mem.readInt(i64, raw_bytes[0..8], .big);
-            // PostgreSQL epoch: 2000-01-01 00:00:00 (946684800 Unix timestamp)
-            const pg_epoch_unix: i64 = 946684800;
-            const unix_seconds = pg_epoch_unix + @divFloor(microseconds, 1_000_000);
-            const micros = @abs(@mod(microseconds, 1_000_000));
 
-            // Format as Unix timestamp with microseconds
-            const ts_str = try std.fmt.allocPrint(allocator, "{d}.{d:0>6}", .{ unix_seconds, micros });
-            return .{ .text = ts_str };
+            // PostgreSQL epoch: 2000-01-01 00:00:00 UTC
+            const PG_EPOCH_SECONDS: i64 = 946684800;
+
+            // Convert PG microsecs to Unix seconds
+            const total_seconds = PG_EPOCH_SECONDS + @divFloor(microseconds, 1_000_000);
+            const remaining_micros: u32 = @intCast(@abs(@mod(microseconds, 1_000_000)));
+
+            // Manual datetime calculation
+            var seconds = total_seconds;
+            var year: i32 = 1970;
+
+            // Count years
+            while (true) {
+                const seconds_in_year: i64 = if (isLeapYear(year)) 366 * 86400 else 365 * 86400;
+                if (seconds < seconds_in_year) break;
+                seconds -= seconds_in_year;
+                year += 1;
+            }
+
+            // Count months
+            const is_leap = isLeapYear(year);
+            const month_days = [12]i32{ 31, if (is_leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+            var month: i32 = 1;
+            for (month_days) |month_len| {
+                const seconds_in_month: i64 = @as(i64, month_len) * 86400;
+                if (seconds < seconds_in_month) break;
+                seconds -= seconds_in_month;
+                month += 1;
+            }
+
+            const day: i32 = @intCast(@divFloor(seconds, 86400) + 1);
+            seconds = @mod(seconds, 86400);
+            const hour: i32 = @intCast(@divFloor(seconds, 3600));
+            seconds = @mod(seconds, 3600);
+            const minute: i32 = @intCast(@divFloor(seconds, 60));
+            const second: i32 = @intCast(@mod(seconds, 60));
+
+            // Format as ISO 8601: 2025-10-26T10:00:00.000000Z (always 27 chars)
+            var buf: [32]u8 = undefined;
+            _ = try std.fmt.bufPrint(
+                &buf,
+                "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}Z",
+                .{
+                    @as(u32, @intCast(year)),
+                    @as(u32, @intCast(month)),
+                    @as(u32, @intCast(day)),
+                    @as(u32, @intCast(hour)),
+                    @as(u32, @intCast(minute)),
+                    @as(u32, @intCast(second)),
+                    remaining_micros,
+                },
+            );
+
+            return .{ .text = try allocator.dupe(u8, buf[0..27]) };
         },
 
         // --- UUID (Binary format - 16 bytes) ---
+        // use `bufPrint` to avoid heap allocation
         .UUID => {
             if (raw_bytes.len != 16) return error.InvalidDataLength;
-            const uuid_str = try std.fmt.allocPrint(
-                allocator,
+            // Format as xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (always 36 chars)
+            var buf: [36]u8 = undefined;
+            _ = try std.fmt.bufPrint(
+                &buf,
                 "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}",
                 .{
                     raw_bytes[0],  raw_bytes[1],  raw_bytes[2],  raw_bytes[3],
@@ -196,22 +294,21 @@ pub fn decodeBinColumnData(
                     raw_bytes[12], raw_bytes[13], raw_bytes[14], raw_bytes[15],
                 },
             );
-            return .{ .text = uuid_str };
+            // UUID is always exactly 36 characters, allocate and return
+            return .{ .text = try allocator.dupe(u8, &buf) };
         },
 
         // --- Variable-Length Text Types (Binary format is still text) ---
-        .TEXT, .VARCHAR, .BPCHAR => {
+        .TEXT,
+        .VARCHAR,
+        .BPCHAR,
+        .BYTEA,
+        .JSON,
+        => {
             // raw_bytes is from readBytes() which uses arena_allocator
             // We need to dupe with main_allocator so it survives arena cleanup
             const owned = try allocator.dupe(u8, raw_bytes);
             return .{ .text = owned };
-        },
-
-        .BYTEA => {
-            // raw_bytes is from readBytes() which uses arena_allocator
-            // We need to dupe with main_allocator so it survives arena cleanup
-            const owned = try allocator.dupe(u8, raw_bytes);
-            return .{ .bytea = owned };
         },
 
         // --- NUMERIC (Binary format - use numeric.zig) ---
@@ -237,12 +334,12 @@ pub fn decodeBinColumnData(
             }
         },
 
-        // --- JSON (text format even in binary mode) ---
-        .JSON => {
-            // PostgreSQL sends JSON as plain text even when binary format is requested
-            const owned = try allocator.dupe(u8, raw_bytes);
-            return .{ .jsonb = owned }; // Use jsonb field for compatibility
-        },
+        // // --- JSON (text format even in binary mode) ---
+        // .JSON => {
+        //     // PostgreSQL sends JSON as plain text even when binary format is requested
+        //     const owned = try allocator.dupe(u8, raw_bytes);
+        //     return .{ .jsonb = owned }; // Use jsonb field for compatibility
+        // },
 
         // --- JSONB (binary format is version byte + JSON text) ---
         .JSONB => {
@@ -592,11 +689,14 @@ pub fn decodeTuple(
     allocator: std.mem.Allocator,
     tuple: TupleData,
     columns: []const RelationMessage.ColumnInfo,
-) !std.StringHashMap(DecodedValue) {
-    var decoded_map = std.StringHashMap(DecodedValue).init(allocator);
-    errdefer decoded_map.deinit();
+) !std.ArrayList(Column) {
+    var decoded_columns = std.ArrayList(Column){};
+    errdefer decoded_columns.deinit(allocator);
 
     if (tuple.columns.len != columns.len) return error.ColumnMismatch;
+
+    // Pre-allocate capacity for all columns
+    try decoded_columns.ensureTotalCapacity(allocator, columns.len);
 
     for (columns, tuple.columns) |col_info, col_data| {
         if (col_data) |raw_bytes| {
@@ -607,14 +707,22 @@ pub fn decodeTuple(
                 log.err("Failed to decode column '{s}' (type_id={d}, bytes={d}): {}", .{ col_info.name, col_info.type_id, raw_bytes.len, err });
                 return err;
             };
-            try decoded_map.put(col_info.name, decoded_value);
+            // Column name points to RelationMessage which has stable lifetime
+            // No need to duplicate - it lives for the entire relation cache
+            decoded_columns.appendAssumeCapacity(Column{
+                .name = col_info.name,
+                .value = decoded_value,
+            });
         } else {
             // Handle NULL values
             log.debug("Column '{s}' is NULL", .{col_info.name});
-            // skip? or use a custom DecodedValue union option for NULL?)
+            decoded_columns.appendAssumeCapacity(Column{
+                .name = col_info.name,
+                .value = .null,
+            });
         }
     }
-    return decoded_map;
+    return decoded_columns;
 }
 
 /// Parser state for decoding pgoutput messages

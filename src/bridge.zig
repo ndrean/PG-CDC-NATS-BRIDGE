@@ -6,7 +6,6 @@ const pgoutput = @import("pgoutput.zig");
 const nats_publisher = @import("nats_publisher.zig");
 const batch_publisher = @import("batch_publisher.zig");
 const async_batch_publisher = @import("async_batch_publisher.zig");
-// const async_direct_publisher = @import("async_direct_publisher.zig");
 const replication_setup = @import("replication_setup.zig");
 const msgpack = @import("msgpack");
 const http_server = @import("http_server.zig");
@@ -42,32 +41,37 @@ fn processCdcEvent(
         log.warn("Failed to decode tuple: {}", .{err});
         return;
     };
-    // NOTE: batch_pub.addEvent() duplicates the values, so we need to free the originals
-    defer {
-        // Free slice-based values before deinit
-        var it = decoded_values.iterator();
-        while (it.next()) |entry| {
-            switch (entry.value_ptr.*) {
+    // NOTE: addEvent() takes ownership of decoded_values.
+    // The flush thread will free them after publishing.
+    errdefer {
+        // Only free on error - if addEvent() fails
+        for (decoded_values.items) |column| {
+            switch (column.value) {
                 .text => |txt| main_allocator.free(txt),
                 .numeric => |num| main_allocator.free(num),
                 .array => |arr| main_allocator.free(arr),
                 .jsonb => |jsn| main_allocator.free(jsn),
                 .bytea => |byt| main_allocator.free(byt),
-                else => {}, // int32, int64, float64, boolean don't need freeing
+                else => {}, // int32, int64, float64, boolean, null don't need freeing
             }
         }
-        decoded_values.deinit();
+        decoded_values.deinit(main_allocator);
     }
 
     // Extract ID value for logging (if present)
-    const id_str = if (decoded_values.get("id")) |id_value| blk: {
-        break :blk switch (id_value) {
-            .int32 => |v| try std.fmt.allocPrint(arena_allocator, "{d}", .{v}),
-            .int64 => |v| try std.fmt.allocPrint(arena_allocator, "{d}", .{v}),
-            .text => |v| try std.fmt.allocPrint(arena_allocator, "{s}", .{v}),
-            else => "?",
-        };
-    } else null;
+    const id_str = blk: {
+        for (decoded_values.items) |column| {
+            if (std.mem.eql(u8, column.name, "id")) {
+                break :blk switch (column.value) {
+                    .int32 => |v| try std.fmt.allocPrint(arena_allocator, "{d}", .{v}),
+                    .int64 => |v| try std.fmt.allocPrint(arena_allocator, "{d}", .{v}),
+                    .text => |v| try std.fmt.allocPrint(arena_allocator, "{s}", .{v}),
+                    else => "?",
+                };
+            }
+        }
+        break :blk null;
+    };
 
     // Convert operation to lowercase for NATS subject
     const operation_lower = try std.ascii.allocLowerString(arena_allocator, operation);
@@ -239,9 +243,9 @@ pub fn main() !void {
 
     // Initialize async batch publisher (with dedicated flush thread)
     const batch_config = batch_publisher.BatchConfig{
-        .max_events = 200,
+        .max_events = 500, // Larger batches = fewer flushes = higher throughput
         .max_wait_ms = 100,
-        .max_payload_bytes = 64 * 1024,
+        .max_payload_bytes = 128 * 1024, // Increase payload limit for larger batches
     };
     var batch_pub = try async_batch_publisher.AsyncBatchPublisher.init(allocator, &publisher, batch_config);
     defer batch_pub.deinit();
@@ -501,11 +505,8 @@ pub fn main() !void {
                     }
                 }
 
-                // Check if batch should be flushed based on time
-                if (batch_pub.shouldFlushByTime()) {
-                    try batch_pub.triggerFlush();
-                    log.debug("Triggered time-based batch flush", .{});
-                }
+                // Lock-free queue handles batching automatically in flush thread
+                // No manual time-based flush needed
 
                 // Direct publisher handles its own flushing
                 // Flush NATS async publishes periodically (backup flush)

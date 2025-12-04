@@ -2,6 +2,7 @@ const std = @import("std");
 const batch_publisher = @import("batch_publisher.zig");
 const nats_publisher = @import("nats_publisher.zig");
 const pgoutput = @import("pgoutput.zig");
+const SPSCQueue = @import("spsc_queue.zig").SPSCQueue;
 
 pub const log = std.log.scoped(.async_batch_publisher);
 
@@ -11,14 +12,12 @@ pub const AsyncBatchPublisher = struct {
     publisher: *nats_publisher.Publisher,
     config: batch_publisher.BatchConfig,
 
-    // Main thread batch (being built)
-    current_batch: std.ArrayList(batch_publisher.CDCEvent),
-    current_payload_size: usize,
-    last_flush_time: i64,
+    // Lock-free event queue (SPSC: Single Producer Single Consumer)
+    // Producer: Main thread adding WAL events
+    // Consumer: Flush thread publishing to NATS
+    event_queue: SPSCQueue(batch_publisher.CDCEvent),
 
-    // Shared state between main thread and flush thread
-    mutex: std.Thread.Mutex,
-    pending_batch: ?std.ArrayList(batch_publisher.CDCEvent), // Batch waiting to be flushed
+    // Atomic state shared between threads
     last_confirmed_lsn: std.atomic.Value(u64), // Last LSN confirmed by NATS
 
     // Flush thread
@@ -30,15 +29,15 @@ pub const AsyncBatchPublisher = struct {
         publisher: *nats_publisher.Publisher,
         config: batch_publisher.BatchConfig,
     ) !AsyncBatchPublisher {
+        // Initialize lock-free queue with power-of-2 capacity
+        // 4096 events = can buffer ~8 batches worth of events at max_events=500
+        const event_queue = try SPSCQueue(batch_publisher.CDCEvent).init(allocator, 4096);
+
         return AsyncBatchPublisher{
             .allocator = allocator,
             .publisher = publisher,
             .config = config,
-            .current_batch = std.ArrayList(batch_publisher.CDCEvent){},
-            .current_payload_size = 0,
-            .last_flush_time = std.time.milliTimestamp(),
-            .mutex = .{},
-            .pending_batch = null,
+            .event_queue = event_queue,
             .last_confirmed_lsn = std.atomic.Value(u64).init(0),
             .flush_thread = null,
             .should_stop = std.atomic.Value(bool).init(false),
@@ -61,36 +60,33 @@ pub const AsyncBatchPublisher = struct {
             thread.join();
         }
 
-        // Clean up current batch
-        for (self.current_batch.items) |*event| {
-            event.deinit(self.allocator);
+        // Clean up any remaining events in the queue
+        while (self.event_queue.pop()) |event| {
+            var mut_event = event;
+            mut_event.deinit(self.allocator);
         }
-        self.current_batch.deinit(self.allocator);
 
-        // Clean up pending batch if any
-        if (self.pending_batch) |*batch| {
-            for (batch.items) |*event| {
-                event.deinit(self.allocator);
-            }
-            batch.deinit(self.allocator);
-        }
+        // Deinit the queue itself
+        self.event_queue.deinit();
 
         log.info("🥁 Async batch publisher stopped", .{});
     }
 
-    /// Add an event to the batch. Non-blocking - only locks briefly to swap batches.
+    /// Add an event to the lock-free queue. Wait-free operation (no locks, no blocking).
+    /// Takes ownership of the `data` ArrayList - caller must not free it.
     pub fn addEvent(
         self: *AsyncBatchPublisher,
         subject: []const u8,
         table: []const u8,
         operation: []const u8,
         msg_id: []const u8,
-        data: ?std.StringHashMap(pgoutput.DecodedValue),
+        data: ?std.ArrayList(pgoutput.Column),
         lsn: u64,
     ) !void {
-        log.debug("📥 Adding event to batch: {s} {s} (current batch size: {d})", .{ operation, table, self.current_batch.items.len });
+        log.debug("📥 Adding event to queue: {s} {s}", .{ operation, table });
 
-        // Make owned copies of the data
+        // Only copy the strings (subject, table, operation, msg_id)
+        // Take ownership of the columns ArrayList directly (zero-copy for column data)
         const owned_subject = try self.allocator.dupeZ(u8, subject);
         errdefer self.allocator.free(owned_subject);
 
@@ -103,64 +99,49 @@ pub const AsyncBatchPublisher = struct {
         const owned_msg_id = try self.allocator.dupe(u8, msg_id);
         errdefer self.allocator.free(owned_msg_id);
 
-        // Clone the data hashmap
-        var owned_data: ?std.StringHashMap(pgoutput.DecodedValue) = null;
-        if (data) |data_map| {
-            owned_data = std.StringHashMap(pgoutput.DecodedValue).init(self.allocator);
-            var it = data_map.iterator();
-            while (it.next()) |entry| {
-                const owned_key = try self.allocator.dupe(u8, entry.key_ptr.*);
-
-                // Deep copy the value, especially text-based fields (slices)
-                const owned_value = switch (entry.value_ptr.*) {
-                    .text => |txt| pgoutput.DecodedValue{ .text = try self.allocator.dupe(u8, txt) },
-                    .numeric => |num| pgoutput.DecodedValue{ .numeric = try self.allocator.dupe(u8, num) },
-                    .array => |arr| pgoutput.DecodedValue{ .array = try self.allocator.dupe(u8, arr) },
-                    .jsonb => |jsn| pgoutput.DecodedValue{ .jsonb = try self.allocator.dupe(u8, jsn) },
-                    .bytea => |byt| pgoutput.DecodedValue{ .bytea = try self.allocator.dupe(u8, byt) },
-                    else => entry.value_ptr.*, // int32, int64, float64, boolean are copied by value
-                };
-
-                try owned_data.?.put(owned_key, owned_value);
-            }
-        }
-
         const event = batch_publisher.CDCEvent{
             .subject = owned_subject,
             .table = owned_table,
             .operation = owned_operation,
             .msg_id = owned_msg_id,
-            .data = owned_data,
+            .data = data, // Transfer ownership - no copy!
             .lsn = lsn,
         };
-
-        try self.current_batch.append(self.allocator, event);
-        self.current_payload_size += table.len + operation.len;
-
-        log.debug("✅ Event added successfully. Batch now has {d} events, {d} bytes", .{ self.current_batch.items.len, self.current_payload_size });
-
-        // Check if we should flush based on count or size
-        const should_flush_count = self.current_batch.items.len >= self.config.max_events;
-        const should_flush_size = self.current_payload_size >= self.config.max_payload_bytes;
-
-        if (should_flush_count or should_flush_size) {
-            if (should_flush_count) {
-                log.debug("Batch full by count: {d}/{d} events", .{ self.current_batch.items.len, self.config.max_events });
-            }
-            if (should_flush_size) {
-                log.debug("Batch full by size: {d}/{d} bytes", .{ self.current_payload_size, self.config.max_payload_bytes });
-            }
-            try self.triggerFlush();
+        // If push fails with unexpected error, clean up the event (including the hashmap we now own)
+        errdefer {
+            var mut_event = event;
+            mut_event.deinit(self.allocator);
         }
-    }
 
-    /// Check if batch should be flushed based on time
-    pub fn shouldFlushByTime(self: *AsyncBatchPublisher) bool {
-        if (self.current_batch.items.len == 0) return false;
+        // Push to lock-free queue with backpressure retry
+        var retry_count: usize = 0;
+        while (true) {
+            self.event_queue.push(event) catch |err| {
+                if (err == error.QueueFull) {
+                    retry_count += 1;
 
-        const now = std.time.milliTimestamp();
-        const elapsed = now - self.last_flush_time;
-        return elapsed >= self.config.max_wait_ms;
+                    // Log warning on first retry, then periodically
+                    if (retry_count == 1 or retry_count % 100 == 0) {
+                        log.warn("Event queue full! Applying backpressure (retry #{d}). Queue capacity: 4096", .{retry_count});
+                    }
+
+                    // Yield CPU to flush thread
+                    std.Thread.yield() catch {};
+                    continue; // Retry
+                }
+
+                // Unexpected error - propagate (errdefer will clean up)
+                return err;
+            };
+
+            // Success!
+            if (retry_count > 0) {
+                log.info("Queue space available after {d} retries, resuming", .{retry_count});
+            }
+            break;
+        }
+
+        log.debug("✅ Event added to lock-free queue", .{});
     }
 
     /// Get the last LSN that was successfully confirmed by NATS
@@ -168,75 +149,83 @@ pub const AsyncBatchPublisher = struct {
         return self.last_confirmed_lsn.load(.seq_cst);
     }
 
-    /// Trigger async flush by swapping current batch with pending
-    pub fn triggerFlush(self: *AsyncBatchPublisher) !void {
-        if (self.current_batch.items.len == 0) return;
-
-        log.debug("Triggering flush for {d} events", .{self.current_batch.items.len});
-
-        // Lock and swap batches
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        // If there's still a pending batch, merge current batch into it
-        // This prevents blocking the main thread while maintaining event order
-        if (self.pending_batch) |*pending| {
-            log.warn("Flush thread is falling behind - merging batches ({d} + {d} events)", .{
-                pending.items.len,
-                self.current_batch.items.len,
-            });
-
-            // Append current batch to pending
-            try pending.appendSlice(self.allocator, self.current_batch.items);
-
-            // Clear current batch (events are now owned by pending)
-            self.current_batch.clearRetainingCapacity();
-            self.current_payload_size = 0;
-            self.last_flush_time = std.time.milliTimestamp();
-        } else {
-            // Move current batch to pending
-            log.info("Moving {d} events to pending batch for flush thread", .{self.current_batch.items.len});
-            self.pending_batch = self.current_batch;
-            self.current_batch = std.ArrayList(batch_publisher.CDCEvent){};
-            self.current_payload_size = 0;
-            self.last_flush_time = std.time.milliTimestamp();
-        }
+    /// Get current queue usage (0.0 = empty, 1.0 = full)
+    pub fn getQueueUsage(self: *AsyncBatchPublisher) f64 {
+        const current_len = self.event_queue.len();
+        const capacity = self.event_queue.capacity;
+        return @as(f64, @floatFromInt(current_len)) / @as(f64, @floatFromInt(capacity));
     }
 
-    /// Background thread that continuously flushes pending batches
+    /// Background thread that continuously drains events from lock-free queue and flushes to NATS
     fn flushLoop(self: *AsyncBatchPublisher) void {
-        log.info("Async flush thread started", .{});
+        log.info("Lock-free flush thread started", .{});
+
         var batches_processed: usize = 0;
+        var last_flush_time = std.time.milliTimestamp();
 
         while (!self.should_stop.load(.seq_cst)) {
-            // Check if there's a pending batch
-            self.mutex.lock();
-            const maybe_batch = self.pending_batch;
-            self.pending_batch = null;
-            self.mutex.unlock();
+            // Create a fresh batch for each flush cycle
+            var batch = std.ArrayList(batch_publisher.CDCEvent){};
 
-            if (maybe_batch) |batch| {
+            // Drain up to max_events from the queue
+            while (batch.items.len < self.config.max_events) {
+                const event = self.event_queue.pop() orelse break;
+                batch.append(self.allocator, event) catch |err| {
+                    log.err("Failed to append to batch: {}", .{err});
+                    // Clean up event on error
+                    var mut_event = event;
+                    mut_event.deinit(self.allocator);
+                    break;
+                };
+            }
+
+            const now = std.time.milliTimestamp();
+            const time_elapsed = now - last_flush_time;
+
+            // Flush if we have events AND (batch is full OR timeout reached)
+            const should_flush = batch.items.len > 0 and
+                (batch.items.len >= self.config.max_events or
+                    time_elapsed >= self.config.max_wait_ms);
+
+            if (should_flush) {
                 batches_processed += 1;
                 log.info("Flush thread processing batch #{d} with {d} events", .{ batches_processed, batch.items.len });
-                // Flush this batch (outside the lock)
+
+                // flushBatch takes ownership and cleans up
                 self.flushBatch(batch) catch |err| {
                     log.err("Failed to flush batch: {}", .{err});
                 };
-            } else {
-                // No pending batch, sleep briefly
+
+                last_flush_time = now;
+            } else if (batch.items.len == 0) {
+                // No events available, sleep briefly to avoid busy-waiting
                 std.Thread.sleep(1 * std.time.ns_per_ms);
+            } else {
+                // Have events but timeout not reached, clean up and retry
+                for (batch.items) |*event| {
+                    var mut_event = event.*;
+                    mut_event.deinit(self.allocator);
+                }
+                batch.deinit(self.allocator);
             }
         }
 
-        // Drain any final pending batch
-        self.mutex.lock();
-        const final_batch = self.pending_batch;
-        self.pending_batch = null;
-        self.mutex.unlock();
+        // Drain any remaining events on shutdown
+        log.info("Flush thread shutting down, draining remaining events...", .{});
+        var final_batch = std.ArrayList(batch_publisher.CDCEvent){};
 
-        if (final_batch) |batch| {
-            log.info("Flushing final batch with {d} events", .{batch.items.len});
-            self.flushBatch(batch) catch |err| {
+        while (self.event_queue.pop()) |event| {
+            final_batch.append(self.allocator, event) catch |err| {
+                log.err("Failed to append final event: {}", .{err});
+                var mut_event = event;
+                mut_event.deinit(self.allocator);
+                break;
+            };
+        }
+
+        if (final_batch.items.len > 0) {
+            log.info("Flushing final batch with {d} events", .{final_batch.items.len});
+            self.flushBatch(final_batch) catch |err| {
                 log.err("Failed to flush final batch: {}", .{err});
             };
         }
