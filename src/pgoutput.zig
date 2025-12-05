@@ -87,6 +87,7 @@ pub const CommitMessage = struct {
 pub const PgOid = enum(u32) {
     // Numeric Types
     BOOL = 16,
+    BYTEA = 17,
     INT2 = 21, // smallint
     INT4 = 23, // integer
     INT8 = 20, // bigint
@@ -105,7 +106,6 @@ pub const PgOid = enum(u32) {
 
     // Others
     UUID = 2950,
-    BYTEA = 17,
     JSON = 114, // json (text format, before jsonb)
     JSONB = 3802,
     NUMERIC = 1700,
@@ -147,6 +147,18 @@ pub const DecodedValue = union(enum) {
     jsonb: []const u8, // JSONB - as JSON string
     array: []const u8, // ARRAY - as JSON string
     bytea: []const u8, // BYTEA - raw bytes or hex/base64 encoded
+};
+
+pub const TupleColKind = enum(u8) {
+    Null = 'n',
+    Unchanged = 'u',
+    Text = 't',
+    Binary = 'b',
+};
+
+pub const TupleCol = struct {
+    kind: TupleColKind,
+    value: ?[]u8, // owned for Text/Binary, null otherwise
 };
 
 /// Decoded column (name + value pair)
