@@ -13,8 +13,12 @@ pub const Metrics = struct {
 
     // Connection state (atomics)
     is_connected: std.atomic.Value(bool),
-    reconnect_count: std.atomic.Value(u32),
+    reconnect_count: std.atomic.Value(u32), // PostgreSQL reconnections
     last_reconnect_time: std.atomic.Value(i64),
+
+    // NATS connection state (atomics)
+    nats_reconnect_count: std.atomic.Value(u32), // NATS reconnections
+    last_nats_reconnect_time: std.atomic.Value(i64),
 
     // WAL lag metrics (atomics)
     slot_active: std.atomic.Value(bool),
@@ -30,6 +34,8 @@ pub const Metrics = struct {
             .is_connected = std.atomic.Value(bool).init(false),
             .reconnect_count = std.atomic.Value(u32).init(0),
             .last_reconnect_time = std.atomic.Value(i64).init(0),
+            .nats_reconnect_count = std.atomic.Value(u32).init(0),
+            .last_nats_reconnect_time = std.atomic.Value(i64).init(0),
             .slot_active = std.atomic.Value(bool).init(false),
             .wal_lag_bytes = std.atomic.Value(u64).init(0),
             .last_wal_check_time = std.atomic.Value(i64).init(0),
@@ -56,11 +62,17 @@ pub const Metrics = struct {
         self.is_connected.store(connected, .monotonic);
     }
 
-    /// Lock-free reconnection tracking
+    /// Lock-free reconnection tracking (PostgreSQL)
     pub fn recordReconnect(self: *Metrics) void {
         _ = self.reconnect_count.fetchAdd(1, .monotonic);
         self.last_reconnect_time.store(std.time.timestamp(), .monotonic);
         self.is_connected.store(true, .monotonic);
+    }
+
+    /// Lock-free NATS reconnection tracking
+    pub fn recordNatsReconnect(self: *Metrics) void {
+        _ = self.nats_reconnect_count.fetchAdd(1, .monotonic);
+        self.last_nats_reconnect_time.store(std.time.timestamp(), .monotonic);
     }
 
     /// Lock-free WAL lag update
@@ -83,8 +95,10 @@ pub const Metrics = struct {
         last_ack_lsn: u64,
         current_lsn_str: []const u8,
         is_connected: bool,
-        reconnect_count: u32,
+        reconnect_count: u32, // PostgreSQL reconnections
         last_reconnect_time: i64,
+        nats_reconnect_count: u32, // NATS reconnections
+        last_nats_reconnect_time: i64,
         slot_active: bool,
         wal_lag_bytes: u64,
         last_wal_check_time: i64,
@@ -111,6 +125,8 @@ pub const Metrics = struct {
             .is_connected = self.is_connected.load(.monotonic),
             .reconnect_count = self.reconnect_count.load(.monotonic),
             .last_reconnect_time = self.last_reconnect_time.load(.monotonic),
+            .nats_reconnect_count = self.nats_reconnect_count.load(.monotonic),
+            .last_nats_reconnect_time = self.last_nats_reconnect_time.load(.monotonic),
             .slot_active = self.slot_active.load(.monotonic),
             .wal_lag_bytes = self.wal_lag_bytes.load(.monotonic),
             .last_wal_check_time = self.last_wal_check_time.load(.monotonic),

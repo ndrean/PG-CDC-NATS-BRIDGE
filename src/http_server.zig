@@ -80,7 +80,7 @@ pub const Server = struct {
     }
 
     fn handleRequest(self: *Server, stream: std.net.Stream) !void {
-        var buffer: [4096]u8 = undefined;
+        var buffer: [2048]u8 = undefined;
 
         // Read request line
         const bytes_read = try stream.read(&buffer);
@@ -155,7 +155,8 @@ pub const Server = struct {
                 \\  "cdc_events_published": {d},
                 \\  "current_lsn": "{s}",
                 \\  "is_connected": {s},
-                \\  "reconnect_count": {d},
+                \\  "pg_reconnect_count": {d},
+                \\  "nats_reconnect_count": {d},
                 \\  "slot_active": {s},
                 \\  "wal_lag_bytes": {d},
                 \\  "wal_lag_mb": {d}
@@ -169,6 +170,7 @@ pub const Server = struct {
                 snap.current_lsn_str,
                 if (snap.is_connected) "true" else "false",
                 snap.reconnect_count,
+                snap.nats_reconnect_count,
                 if (snap.slot_active) "true" else "false",
                 snap.wal_lag_bytes,
                 snap.wal_lag_bytes / (1024 * 1024), // Convert to MB
@@ -210,9 +212,13 @@ pub const Server = struct {
                 \\# TYPE bridge_connected gauge
                 \\bridge_connected {d}
                 \\
-                \\# HELP bridge_reconnects_total Total number of reconnections
-                \\# TYPE bridge_reconnects_total counter
-                \\bridge_reconnects_total {d}
+                \\# HELP bridge_pg_reconnects_total Total number of PostgreSQL reconnections
+                \\# TYPE bridge_pg_reconnects_total counter
+                \\bridge_pg_reconnects_total {d}
+                \\
+                \\# HELP bridge_nats_reconnects_total Total number of NATS reconnections
+                \\# TYPE bridge_nats_reconnects_total counter
+                \\bridge_nats_reconnects_total {d}
                 \\
                 \\# HELP bridge_slot_active Replication slot active status (1=active, 0=inactive)
                 \\# TYPE bridge_slot_active gauge
@@ -229,6 +235,7 @@ pub const Server = struct {
                 snap.last_ack_lsn,
                 if (snap.is_connected) @as(u8, 1) else @as(u8, 0),
                 snap.reconnect_count,
+                snap.nats_reconnect_count,
                 if (snap.slot_active) @as(u8, 1) else @as(u8, 0),
                 snap.wal_lag_bytes,
             });

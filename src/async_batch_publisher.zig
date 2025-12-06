@@ -19,6 +19,7 @@ pub const AsyncBatchPublisher = struct {
 
     // Atomic state shared between threads
     last_confirmed_lsn: std.atomic.Value(u64), // Last LSN confirmed by NATS
+    fatal_error: std.atomic.Value(bool), // Set when NATS reconnection fails
 
     // Flush thread
     flush_thread: ?std.Thread,
@@ -39,6 +40,7 @@ pub const AsyncBatchPublisher = struct {
             .config = config,
             .event_queue = event_queue,
             .last_confirmed_lsn = std.atomic.Value(u64).init(0),
+            .fatal_error = std.atomic.Value(bool).init(false),
             .flush_thread = null,
             .should_stop = std.atomic.Value(bool).init(false),
         };
@@ -156,6 +158,11 @@ pub const AsyncBatchPublisher = struct {
         return @as(f64, @floatFromInt(current_len)) / @as(f64, @floatFromInt(capacity));
     }
 
+    /// Check if a fatal error occurred (e.g., NATS reconnection timeout)
+    pub fn hasFatalError(self: *AsyncBatchPublisher) bool {
+        return self.fatal_error.load(.seq_cst);
+    }
+
     /// Background thread that continuously drains events from lock-free queue and flushes to NATS
     fn flushLoop(self: *AsyncBatchPublisher) void {
         log.info("Lock-free flush thread started", .{});
@@ -177,27 +184,10 @@ pub const AsyncBatchPublisher = struct {
 
         while (!self.should_stop.load(.seq_cst)) {
             // Drain events from the queue until we hit a threshold
-            // Keep draining as long as events are available OR we haven't waited long enough
-            var consecutive_empty_pops: usize = 0;
-            const max_empty_pops_before_flush_check = 10; // Wait for ~10ms of queue being empty
-
             while (batch.items.len < self.config.max_events and
-                current_payload_size < self.config.max_payload_bytes and
-                consecutive_empty_pops < max_empty_pops_before_flush_check)
+                current_payload_size < self.config.max_payload_bytes)
             {
-                const event = self.event_queue.pop() orelse {
-                    // Queue is empty, but might have more events incoming
-                    // Sleep briefly and try again before giving up
-                    consecutive_empty_pops += 1;
-                    if (batch.items.len > 0) {
-                        // We have events in batch, wait a bit for more to arrive
-                        std.Thread.sleep(1 * std.time.ns_per_ms);
-                    }
-                    continue;
-                };
-
-                // Got an event! Reset empty counter
-                consecutive_empty_pops = 0;
+                const event = self.event_queue.pop() orelse break;
 
                 // Approximate payload size (table + operation + subject strings)
                 const event_size = event.table.len + event.operation.len + event.subject.len;
@@ -235,15 +225,13 @@ pub const AsyncBatchPublisher = struct {
                     });
                 }
 
-                // Flush the current batch - flushBatch will take ownership and free the buffer
-                // After this, batch.items will point to freed memory, so we reset it
-                self.flushBatch(batch) catch |err| {
+                // Flush the current batch - this will free the events but retain capacity
+                self.flushBatch(&batch) catch |err| {
                     log.err("Failed to flush batch: {}", .{err});
-                    // On error, flushBatch still freed the buffer, so reset batch
                 };
 
-                // Reset batch to empty state (buffer was freed by flushBatch)
-                batch = std.ArrayList(batch_publisher.CDCEvent){};
+                // Clear the batch (capacity is retained for reuse)
+                // Events were already freed by flushBatch
                 current_payload_size = 0;
 
                 last_flush_time = now;
@@ -258,10 +246,10 @@ pub const AsyncBatchPublisher = struct {
 
         // Drain any remaining events on shutdown
         log.info("Flush thread shutting down, draining remaining events...", .{});
-        var final_batch = std.ArrayList(batch_publisher.CDCEvent){};
 
+        // Drain remaining events into the existing batch
         while (self.event_queue.pop()) |event| {
-            final_batch.append(self.allocator, event) catch |err| {
+            batch.append(self.allocator, event) catch |err| {
                 log.err("Failed to append final event: {}", .{err});
                 var mut_event = event;
                 mut_event.deinit(self.allocator);
@@ -269,18 +257,18 @@ pub const AsyncBatchPublisher = struct {
             };
         }
 
-        if (final_batch.items.len > 0) {
-            log.info("Flushing final batch with {d} events", .{final_batch.items.len});
-            self.flushBatch(final_batch) catch |err| {
+        if (batch.items.len > 0) {
+            log.info("Flushing final batch with {d} events", .{batch.items.len});
+            self.flushBatch(&batch) catch |err| {
                 log.err("Failed to flush final batch: {}", .{err});
             };
         }
     }
 
     /// Flush a batch to NATS (runs in flush thread)
-    fn flushBatch(self: *AsyncBatchPublisher, batch: std.ArrayList(batch_publisher.CDCEvent)) !void {
+    /// Takes a pointer to the batch ArrayList and clears it after flushing (retaining capacity)
+    fn flushBatch(self: *AsyncBatchPublisher, batch: *std.ArrayList(batch_publisher.CDCEvent)) !void {
         if (batch.items.len == 0) {
-            @constCast(&batch).deinit(self.allocator);
             return;
         }
 
@@ -290,24 +278,32 @@ pub const AsyncBatchPublisher = struct {
         log.info("⚡ Flushing batch of {d} events", .{event_count});
 
         // Use temporary BatchPublisher for actual encoding/publishing logic
+        // IMPORTANT: We pass batch.* (by value) which creates a shallow copy
+        // But we'll manage cleanup carefully to avoid double-free
         var temp_publisher = batch_publisher.BatchPublisher{
             .allocator = self.allocator,
             .publisher = self.publisher,
             .config = self.config,
-            .events = batch, // Transfer ownership to temp_publisher
+            .events = batch.*, // Shallow copy - temp_publisher.events now shares buffer with batch
             .current_payload_size = 0,
             .last_flush_time = 0,
             .last_confirmed_lsn = 0,
         };
 
-        // Call the existing flush implementation (it will clean up events)
+        // Call the existing flush implementation
+        // This will free the events and call clearRetainingCapacity()
         const confirmed_lsn = temp_publisher.flush() catch |err| {
             log.err("Flush failed: {}", .{err});
-            // Clean up on error
-            for (temp_publisher.events.items) |*event| {
-                event.deinit(self.allocator);
+
+            // Check if this is a NATS timeout - trigger fatal error to shutdown bridge
+            if (err == error.FlushFailed) {
+                self.fatal_error.store(true, .seq_cst);
+                log.err("🔴 FATAL: NATS reconnection timeout exceeded - bridge must shutdown to prevent WAL overflow", .{});
             }
-            temp_publisher.events.deinit(self.allocator);
+
+            // On error, events may be partially freed
+            // Clear the batch to prevent use-after-free
+            batch.clearRetainingCapacity();
             return err;
         };
 
@@ -317,9 +313,10 @@ pub const AsyncBatchPublisher = struct {
             log.debug("Updated last confirmed LSN to {x}", .{confirmed_lsn});
         }
 
-        // temp_publisher.flush() already cleaned up events but retained capacity
-        // We need to deinit the ArrayList to free the capacity buffer
-        temp_publisher.events.deinit(self.allocator);
+        // temp_publisher.flush() already freed the events and called clearRetainingCapacity()
+        // Since batch and temp_publisher.events share the same buffer, we need to sync them
+        // The buffer now has len=0 but retains capacity for reuse
+        batch.clearRetainingCapacity();
 
         // Log flush timing
         const flush_elapsed = std.time.milliTimestamp() - flush_start;

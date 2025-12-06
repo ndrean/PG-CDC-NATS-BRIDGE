@@ -10,6 +10,8 @@ const c = @cImport({
 /// NATS Publisher Configuration
 pub const PublisherConfig = struct {
     url: [:0]const u8 = "nats://127.0.0.1:4222",
+    max_reconnect_attempts: i32 = -1, // -1 = infinite
+    reconnect_wait_ms: i64 = 2000, // 2 seconds between attempts
 };
 
 /// JetStream Stream Configuration
@@ -50,10 +52,52 @@ pub const StreamConfig = struct {
     };
 };
 
+// NATS C callbacks must be extern "C" functions (not closures)
+// We use a global pointer to track reconnection state
+var reconnect_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+fn disconnectedCallback(_: ?*c.natsConnection, user_data: ?*anyopaque) callconv(.c) void {
+    _ = user_data;
+    log.warn("🔴 NATS connection lost - attempting reconnection...", .{});
+}
+
+fn reconnectedCallback(nc: ?*c.natsConnection, user_data: ?*anyopaque) callconv(.c) void {
+    _ = reconnect_count.fetchAdd(1, .monotonic);
+    const count = reconnect_count.load(.monotonic);
+
+    // Update metrics if provided
+    if (user_data) |data| {
+        const metrics_mod = @import("metrics.zig");
+        const metrics_ptr: *metrics_mod.Metrics = @ptrCast(@alignCast(data));
+        metrics_ptr.recordNatsReconnect();
+    }
+
+    // Get current URL
+    if (nc) |conn| {
+        var url_buf: [256]u8 = undefined;
+        const status = c.natsConnection_GetConnectedUrl(conn, &url_buf, url_buf.len);
+        if (status == c.NATS_OK) {
+            const url_str = std.mem.sliceTo(&url_buf, 0);
+            log.info("🟢 NATS reconnected to {s} (reconnect #{d})", .{ url_str, count });
+        } else {
+            log.info("🟢 NATS reconnected (reconnect #{d})", .{count});
+        }
+    } else {
+        log.info("🟢 NATS reconnected (reconnect #{d})", .{count});
+    }
+}
+
+fn closedCallback(_: ?*c.natsConnection, user_data: ?*anyopaque) callconv(.c) void {
+    _ = user_data;
+    log.err("🔴 NATS connection closed permanently", .{});
+}
+
 /// Core NATS/JetStream Publisher
 ///
 /// Provides low-level NATS connectivity and JetStream publishing.
 /// Independent of any domain-specific logic (e.g., CDC).
+///
+/// Features automatic reconnection on connection loss.
 ///
 /// Usage:
 /// ```zig
@@ -68,7 +112,7 @@ pub const StreamConfig = struct {
 /// };
 /// try createStream(publisher.js.?, allocator, stream_config);
 ///
-/// // Publish messages
+/// // Publish messages (automatically reconnects on failure)
 /// try publisher.publish("events.test", "Hello", null);
 /// ```
 pub const Publisher = struct {
@@ -77,6 +121,8 @@ pub const Publisher = struct {
     nc: ?*c.natsConnection = null,
     js: ?*c.jsCtx = null,
     nats_host: [:0]const u8 = "",
+    is_connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    metrics: ?*@import("metrics.zig").Metrics = null, // Optional metrics tracking
 
     pub fn init(allocator: std.mem.Allocator, config: PublisherConfig) !Publisher {
         const nats_uri = std.process.getEnvVarOwned(allocator, "NATS_HOST") catch |err| blk: {
@@ -120,6 +166,53 @@ pub const Publisher = struct {
             return error.NatsSetURLFailed;
         }
 
+        // Enable automatic reconnection
+        status = c.natsOptions_SetMaxReconnect(opts, self.config.max_reconnect_attempts);
+        if (status != c.NATS_OK) {
+            log.err("🔴 Failed to set max reconnect attempts: {s}", .{c.natsStatus_GetText(status)});
+            return error.NatsOptionsSetFailed;
+        }
+
+        status = c.natsOptions_SetReconnectWait(opts, self.config.reconnect_wait_ms);
+        if (status != c.NATS_OK) {
+            log.err("🔴 Failed to set reconnect wait time: {s}", .{c.natsStatus_GetText(status)});
+            return error.NatsOptionsSetFailed;
+        }
+
+        // Set connection event callbacks (pass metrics pointer via user_data)
+        const metrics_ptr = if (self.metrics) |m| @as(?*anyopaque, @ptrCast(m)) else null;
+
+        status = c.natsOptions_SetDisconnectedCB(opts, disconnectedCallback, metrics_ptr);
+        if (status != c.NATS_OK) {
+            log.err("🔴 Failed to set disconnected callback: {s}", .{c.natsStatus_GetText(status)});
+            return error.NatsOptionsSetFailed;
+        }
+
+        status = c.natsOptions_SetReconnectedCB(opts, reconnectedCallback, metrics_ptr);
+        if (status != c.NATS_OK) {
+            log.err("🔴 Failed to set reconnected callback: {s}", .{c.natsStatus_GetText(status)});
+            return error.NatsOptionsSetFailed;
+        }
+
+        status = c.natsOptions_SetClosedCB(opts, closedCallback, null);
+        if (status != c.NATS_OK) {
+            log.err("🔴 Failed to set closed callback: {s}", .{c.natsStatus_GetText(status)});
+            return error.NatsOptionsSetFailed;
+        }
+
+        // Allow reconnection to same server
+        status = c.natsOptions_SetAllowReconnect(opts, true);
+        if (status != c.NATS_OK) {
+            log.err("🔴 Failed to enable reconnection: {s}", .{c.natsStatus_GetText(status)});
+            return error.NatsOptionsSetFailed;
+        }
+
+        log.info("Connecting to NATS at {s} (auto-reconnect enabled: max={d}, wait={d}ms)...", .{
+            self.nats_host,
+            self.config.max_reconnect_attempts,
+            self.config.reconnect_wait_ms,
+        });
+
         // Connect to NATS
         status = c.natsConnection_Connect(&self.nc, opts);
         if (status != c.NATS_OK) {
@@ -128,6 +221,7 @@ pub const Publisher = struct {
         }
 
         log.info("🟢 Connected to NATS at {s}", .{self.nats_host});
+        self.is_connected.store(true, .seq_cst);
 
         // Get JetStream context
         status = c.natsConnection_JetStream(&self.js, self.nc, null);
@@ -141,6 +235,8 @@ pub const Publisher = struct {
     }
 
     pub fn deinit(self: *Publisher) void {
+        self.is_connected.store(false, .seq_cst);
+
         if (self.js) |js| {
             c.jsCtx_Destroy(js);
             self.js = null;
@@ -156,6 +252,20 @@ pub const Publisher = struct {
         self.nats_host = "";
 
         log.info("🥁 Disconnected from NATS", .{});
+    }
+
+    /// Check if NATS connection is alive (not disconnected/closed)
+    pub fn isConnected(self: *Publisher) bool {
+        if (self.nc) |nc| {
+            const status = c.natsConnection_Status(nc);
+            return status == c.NATS_CONN_STATUS_CONNECTED or status == c.NATS_CONN_STATUS_RECONNECTING;
+        }
+        return false;
+    }
+
+    /// Get the number of times NATS has reconnected
+    pub fn getReconnectCount() u32 {
+        return reconnect_count.load(.monotonic);
     }
 
     /// Publish a message to JetStream asynchronously with optional message ID for deduplication
@@ -214,6 +324,9 @@ pub const Publisher = struct {
     ///
     /// Call this periodically to complete pending async publishes.
     /// This blocks until all pending publishes are acknowledged or timeout.
+    ///
+    /// Timeout is set to 10 seconds to allow for NATS reconnection attempts.
+    /// With reconnect_wait_ms=2000, NATS can attempt reconnection up to 5 times.
     pub fn flushAsync(self: *Publisher) !void {
         if (self.js == null) {
             return error.NotConnected;
@@ -221,18 +334,36 @@ pub const Publisher = struct {
 
         log.debug("Flushing async publishes...", .{});
 
-        // Set a timeout of 5 seconds for flush
+        // Set a timeout of 10 seconds to allow for reconnection
+        // NATS C library will retry reconnection during this time
         var opts: c.jsPubOptions = undefined;
         const init_status = c.jsPubOptions_Init(&opts);
         if (init_status != c.NATS_OK) {
             log.err("Failed to initialize jsPubOptions for flush", .{});
             return error.InitFailed;
         }
-        opts.MaxWait = 5000; // 5 seconds timeout
+        opts.MaxWait = 10_000; // 10 seconds timeout (allows ~5 reconnection attempts)
 
         const status = c.js_PublishAsyncComplete(self.js, &opts);
         if (status != c.NATS_OK) {
-            log.err("🔴 Async publish completion failed: {s}", .{c.natsStatus_GetText(status)});
+            const status_text = c.natsStatus_GetText(status);
+
+            // Check if it's a connection issue vs other error
+            if (self.nc) |nc| {
+                const conn_status = c.natsConnection_Status(nc);
+                if (conn_status == c.NATS_CONN_STATUS_RECONNECTING) {
+                    log.warn("🔴 Flush timeout while NATS reconnecting: {s}", .{status_text});
+                } else if (conn_status == c.NATS_CONN_STATUS_DISCONNECTED) {
+                    log.err("🔴 Flush failed - NATS disconnected: {s}", .{status_text});
+                } else if (conn_status == c.NATS_CONN_STATUS_CLOSED) {
+                    log.err("🔴 Flush failed - NATS connection closed: {s}", .{status_text});
+                } else {
+                    log.err("🔴 Async publish completion failed: {s}", .{status_text});
+                }
+            } else {
+                log.err("🔴 Async publish completion failed: {s}", .{status_text});
+            }
+
             return error.FlushFailed;
         }
         log.debug("✅ Async publishes flushed successfully", .{});

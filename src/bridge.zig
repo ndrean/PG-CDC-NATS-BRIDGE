@@ -217,6 +217,10 @@ pub fn main() !void {
         .url = "nats://localhost:4222",
     });
     defer publisher.deinit();
+
+    // Set metrics pointer for NATS reconnection tracking
+    publisher.metrics = &metrics;
+
     try publisher.connect();
 
     // Ensure CDC stream exists (created by infrastructure)
@@ -339,6 +343,12 @@ pub fn main() !void {
 
     // Run until graceful shutdown signal received
     while (!should_stop.load(.seq_cst)) {
+        // Check for fatal NATS errors (e.g., reconnection timeout exceeded)
+        if (batch_pub.hasFatalError()) {
+            log.err("🔴 FATAL ERROR: NATS reconnection failed - shutting down bridge to prevent WAL overflow", .{});
+            break;
+        }
+
         if (pg_stream.receiveMessage()) |maybe_msg| {
             if (maybe_msg) |wal_msg_val| {
                 var wal_msg = wal_msg_val;
@@ -534,13 +544,14 @@ pub fn main() !void {
                     defer allocator.free(snap.current_lsn_str);
 
                     // Structured log format parseable by Grafana Alloy
-                    log.info("METRICS uptime={d} wal_messages={d} cdc_events={d} lsn={s} connected={d} reconnects={d} lag_bytes={d} slot_active={d}", .{
+                    log.info("METRICS uptime={d} wal_messages={d} cdc_events={d} lsn={s} connected={d} pg_reconnects={d} nats_reconnects={d} lag_bytes={d} slot_active={d}", .{
                         snap.uptime_seconds,
                         snap.wal_messages_received,
                         snap.cdc_events_published,
                         snap.current_lsn_str,
                         if (snap.is_connected) @as(u8, 1) else @as(u8, 0),
                         snap.reconnect_count,
+                        snap.nats_reconnect_count,
                         snap.wal_lag_bytes,
                         if (snap.slot_active) @as(u8, 1) else @as(u8, 0),
                     });

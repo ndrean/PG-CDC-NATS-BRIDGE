@@ -7,24 +7,28 @@ defmodule PgProducer do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  def check_table(name \\ "users") do
-    GenServer.call(__MODULE__, {:check_table, name})
+  def check(name \\ "users") do
+    GenServer.call(__MODULE__, {:check, name})
   end
 
-  def drop_table(name \\ "users") do
-    GenServer.call(__MODULE__, {:drop_table, name})
+  def drop(name \\ "users") do
+    GenServer.call(__MODULE__, {:drop, name})
   end
 
-  def new_table(name \\ "users") do
-    GenServer.call(__MODULE__, {:create_new_table, name})
+  # def new_table(name \\ "users") do
+  #   GenServer.call(__MODULE__, {:new_table, name})
+  # end
+
+  def bulk(nb, name \\ "users") do
+    GenServer.call(__MODULE__, {:bulk, nb, name})
   end
 
-  def run(nb, name \\ "users") do
-    GenServer.call(__MODULE__, {:run, nb, name})
+  def crud() do
+    GenServer.call(__MODULE__, :crud)
   end
 
-  def run_test() do
-    GenServer.call(__MODULE__, :crud_test)
+  def stream(take, nb, int \\ 1) do
+    GenServer.call(__MODULE__, {:stream, take, nb, int})
   end
 
   @impl GenServer
@@ -35,17 +39,13 @@ defmodule PgProducer do
     {:ok, {pid, 0}}
   end
 
-  @impl GenServer
-
-  def handle_call({:create_new_table, name}, _, {pid, _} = state) do
-    :ok = create_table(name, pid)
-    {:reply, :ok, state}
-  end
+  # def handle_call({:new_table, name}, _, {pid, _} = state) do
+  #   :ok = create_table(name, pid)
+  #   {:reply, :ok, state}
+  # end
 
   @impl GenServer
-  def handle_call({:run, nb, name}, _, {pid, i} = _state) do
-    # Logger.info("Running PG statements...")
-
+  def handle_call({:bulk, nb, name}, _, {pid, i} = _state) do
     # Generate list of maps for bulk insert
 
     values =
@@ -58,61 +58,50 @@ defmodule PgProducer do
 
     Producer.Repo.insert_all(name, values)
 
-    # %Postgrex.Result{} =
-    # Postgrex.query!(pid, """
-    # INSERT INTO #{name} (name, email)
-    # VALUES ('#{user_name}', 'user#{i}@example.com');
-    # """)
-
-    # cond do
-    #   rem(i, 5) == 0 ->
-    #     user_name = "User #{i}"
-
-    #     %Postgrex.Result{} =
-    #       Postgrex.query!(state, "DELETE FROM #{name} WHERE name = $1", [user_name])
-
-    #   rem(i, 2) == 0 ->
-    #     %Postgrex.Result{} =
-    #       Postgrex.query!(state, """
-    #       UPDATE #{name} SET name = '#{user_name}', email = 'user#{i}@example.com'
-    #       WHERE id = #{i};
-    #       """)
-
-    #   true ->
-    #     :ok
-    # end
-    # end
-
-    # Logger.info("PG job done")
-
     {:reply, :ok, {pid, i + 1}}
   end
 
-  @impl GenServer
-  def handle_call({:check_table, name}, _, {pid, _} = state) do
-    try do
-      query =
-        Postgrex.prepare!(pid, "", "SELECT * FROM #{name};", [])
+  def handle_call({:check, name}, _, {pid, _} = state) do
+    # try do
+    query =
+      Postgrex.prepare!(pid, "", "SELECT * FROM #{name};", []) |> dbg()
 
-      len =
-        Postgrex.execute!(pid, query, [])
-        |> Map.get(:num_rows)
+    len =
+      Postgrex.execute!(pid, query, [])
+      |> Map.get(:num_rows)
+      |> dbg()
 
-      {:reply, len, state}
-    rescue
-      e in Postgrex.Error ->
-        {:reply, e.postgres.message, state}
-    end
+    {:reply, len, state}
+    # rescue
+    # e in Postgrex.Error ->
+    # {:reply, e.postgres.message, state}
+    # end
+    {:reply, len, state}
   end
 
   @impl GenServer
-  def handle_call({:drop_table, name}, _, {pid, _} = state) do
+  def handle_call({:drop, name}, _, {pid, _} = state) do
     Postgrex.query!(pid, "DROP TABLE IF EXISTS #{name};")
     {:reply, :ok, state}
   end
 
-  def handle_call(:crud_test, _, {pid, _} = state) do
+  def handle_call(:crud, _, {pid, _} = state) do
     crud_test(pid)
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:stream, take, nb, int}, _, state) do
+    Task.start(fn ->
+      Stream.interval(int)
+      |> Stream.take(take)
+      |> Task.async_stream(
+        fn _ -> PgProducer.bulk(nb, "users") end,
+        ordered: false
+      )
+      |> Stream.run()
+    end)
+    |> dbg()
+
     {:reply, :ok, state}
   end
 

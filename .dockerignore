@@ -16,3 +16,4 @@ nats-data/
 
 # Docker
 postgres-data/
+/consumer/
