@@ -82,6 +82,7 @@ pub const AsyncBatchPublisher = struct {
         table: []const u8,
         operation: []const u8,
         msg_id: []const u8,
+        relation_id: u32,
         data: ?std.ArrayList(pgoutput.Column),
         lsn: u64,
     ) !void {
@@ -106,6 +107,7 @@ pub const AsyncBatchPublisher = struct {
             .table = owned_table,
             .operation = owned_operation,
             .msg_id = owned_msg_id,
+            .relation_id = relation_id,
             .data = data, // Transfer ownership - no copy!
             .lsn = lsn,
         };

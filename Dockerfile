@@ -1,8 +1,8 @@
 # Multi-stage build for production
-# Stage 1: Build the bridge binary
+# Using debian:bookworm-slim for glibc support with smaller footprint
+
 FROM debian:bookworm-slim AS builder
 
-# Install build dependencies
 RUN apt-get update && apt-get install -y \
     curl \
     xz-utils \
@@ -31,21 +31,14 @@ RUN ARCH=$(uname -m) && \
     ln -s /usr/local/zig/zig /usr/local/bin/zig && \
     rm zig.tar.xz
 
-# Set working directory
 WORKDIR /build
-
-# Copy source files
 COPY . .
 
 # Clean any existing builds
 RUN rm -rf libs/nats-install libs/nats.c/build libs/libpq-install zig-out zig-cache
 
-# Build the bridge in ReleaseSmall mode for production
-# This optimizes for binary size while maintaining good performance
 RUN zig build -Doptimize=ReleaseFast
 
-# Stage 2: Runtime image with minimal dependencies
-# Using debian:bookworm-slim for glibc support with smaller footprint
 FROM debian:bookworm-slim
 
 # Install only runtime PostgreSQL library
@@ -54,7 +47,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the built binary from builder stage
 COPY --from=builder /build/zig-out/bin/bridge /usr/local/bin/bridge
 
 # Default command

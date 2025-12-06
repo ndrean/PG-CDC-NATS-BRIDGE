@@ -13,11 +13,33 @@ const metrics_mod = @import("metrics.zig");
 const wal_monitor = @import("wal_monitor.zig");
 const pg_conn = @import("pg_conn.zig");
 const args = @import("args.zig");
+const schema_publisher = @import("schema_publisher.zig");
 
 pub const log = std.log.scoped(.bridge);
 
 // Global flag for graceful shutdown (shared with HTTP server)
 var should_stop = std.atomic.Value(bool).init(false);
+
+/// Initialize and verify all required NATS JetStream streams exist
+/// Streams should be created by infrastructure (nats-init), this function only verifies they exist
+fn initStreams(
+    publisher: *nats_publisher.Publisher,
+    allocator: std.mem.Allocator,
+    stream_names: []const []const u8,
+) !void {
+    log.info("Verifying {d} NATS JetStream stream(s)...", .{stream_names.len});
+
+    for (stream_names) |stream_name| {
+        const stream_name_z = try allocator.dupeZ(u8, stream_name);
+        defer allocator.free(stream_name_z);
+
+        // Verify stream exists and is accessible (fail-fast if not)
+        try nats_publisher.ensureStream(publisher.js.?, allocator, stream_name_z);
+        log.info("  ✅ Stream '{s}' verified", .{stream_name});
+    }
+
+    log.info("✅ All NATS JetStream streams verified\n", .{});
+}
 
 /// Helper to process and publish a CDC event (INSERT/UPDATE/DELETE)
 fn processCdcEvent(
@@ -100,8 +122,8 @@ fn processCdcEvent(
         .{ wal_end, rel.name, operation_lower },
     );
 
-    // Add to batch publisher with column data and LSN
-    try batch_pub.addEvent(subject, rel.name, operation, msg_id, decoded_values, wal_end);
+    // Add to batch publisher with column data, relation_id, and LSN
+    try batch_pub.addEvent(subject, rel.name, operation, msg_id, rel.relation_id, decoded_values, wal_end);
     metrics.incrementCdcEvents();
 
     // Log single line with table, operation, and ID
@@ -134,12 +156,20 @@ pub fn main() !void {
             allocator.free(table);
         }
         allocator.free(parsed_args.tables);
+        for (parsed_args.streams) |stream| {
+            allocator.free(stream);
+        }
+        allocator.free(parsed_args.streams);
     }
 
     log.info("▶️ Starting CDC Bridge with parameters:\n", .{});
     log.info("Publication name: \x1b[1m {s} \x1b[0m", .{parsed_args.publication_name});
     log.info("Slot name: \x1b[1m {s} \x1b[0m", .{parsed_args.slot_name});
-    log.info("Stream name: \x1b[1m {s} \x1b[0m", .{parsed_args.stream_name});
+
+    const parsed_streams = try std.mem.join(allocator, ", ", parsed_args.streams);
+    defer allocator.free(parsed_streams);
+    log.info("Streams: \x1b[1m {s} \x1b[0m", .{parsed_streams});
+
     log.info("HTTP port: \x1b[1m {d} \x1b[0m", .{parsed_args.http_port});
 
     if (parsed_args.tables.len == 0) {
@@ -223,23 +253,35 @@ pub fn main() !void {
 
     try publisher.connect();
 
-    // Ensure CDC stream exists (created by infrastructure)
-    const stream_name_z = try allocator.dupeZ(u8, parsed_args.stream_name);
-    defer allocator.free(stream_name_z);
+    // Verify all required streams exist (created by infrastructure)
+    try initStreams(&publisher, allocator, parsed_args.streams);
 
-    // Verify stream exists and is accessible (fail-fast if not)
-    try nats_publisher.ensureStream(
-        publisher.js.?,
-        allocator,
-        stream_name_z,
-    );
-    log.info("✅ NATS JetStream stream verified\n", .{});
+    // Initialize schema cache for tracking relation_id changes
+    var schema_cache = schema_publisher.SchemaCache.init(allocator);
+    defer schema_cache.deinit();
+    log.info("✅ Schema cache initialized\n", .{});
 
-    // Generate subject pattern from stream name for publishing
+    // Find CDC stream for subject pattern generation
+    // CDC events are published to subjects like "cdc.table.operation"
+    const cdc_stream_name = blk: {
+        for (parsed_args.streams) |stream_name| {
+            if (std.mem.eql(u8, stream_name, "CDC")) {
+                break :blk stream_name;
+            }
+        }
+        // If CDC stream not found in list, use first stream or fail
+        if (parsed_args.streams.len > 0) {
+            log.warn("CDC stream not found in stream list, using first stream: {s}", .{parsed_args.streams[0]});
+            break :blk parsed_args.streams[0];
+        }
+        return error.NoCDCStreamConfigured;
+    };
+
+    // Generate subject pattern from CDC stream name for publishing
     // Convert stream name to lowercase and use as subject prefix
     // Example: CDC -> "cdc.>" subjects
     var subject_buf: [128]u8 = undefined;
-    const subject_str = try std.fmt.bufPrint(&subject_buf, "{s}.>", .{parsed_args.stream_name});
+    const subject_str = try std.fmt.bufPrint(&subject_buf, "{s}.>", .{cdc_stream_name});
 
     // Convert to lowercase for subject pattern
     var lower_subject_buf: [128]u8 = undefined;
@@ -388,6 +430,13 @@ pub fn main() !void {
                                 // (arena will be destroyed at end of scope)
                                 const cloned_rel_ptr = try rel.clone(allocator);
                                 defer allocator.destroy(cloned_rel_ptr);
+
+                                // Check if schema changed and publish to SCHEMA stream if needed
+                                const schema_changed = try schema_cache.hasChanged(rel.name, rel.relation_id);
+                                if (schema_changed) {
+                                    log.info("🔔 Schema change detected for table '{s}' (relation_id={d})", .{ rel.name, rel.relation_id });
+                                    try schema_publisher.publishSchema(&publisher, &rel, allocator);
+                                }
 
                                 // If relation already exists, free the old one first
                                 const result = try relation_map.fetchPut(cloned_rel_ptr.relation_id, cloned_rel_ptr.*);

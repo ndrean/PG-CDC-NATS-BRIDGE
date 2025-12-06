@@ -5,7 +5,7 @@ const log = std.log.scoped(.args);
 
 /// Command-line arguments structure
 pub const Args = struct {
-    stream_name: []const u8,
+    streams: []const []const u8, // Stream names to verify (e.g., CDC, SCHEMA)
     http_port: u16,
     slot_name: []const u8,
     publication_name: []const u8,
@@ -16,7 +16,7 @@ pub const Args = struct {
         // Parse command-line arguments
         var args = try std.process.argsWithAllocator(allocator);
         _ = args.skip(); // Skip program name
-        var stream_name: []const u8 = "CDC_BRIDGE"; // default
+        var streams: []const []const u8 = &.{"CDC"}; // default: CDC stream only
         var http_port: u16 = 8080; // default
         var slot_name: []const u8 = "bridge_slot"; // default
         var publication_name: []const u8 = "bridge_pub"; // default
@@ -25,7 +25,26 @@ pub const Args = struct {
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--stream")) {
                 if (args.next()) |value| {
-                    stream_name = value;
+                    // Parse comma-separated stream names
+                    var stream_list = std.ArrayList([]const u8){};
+                    defer stream_list.deinit(allocator);
+
+                    var iter = std.mem.splitScalar(u8, value, ',');
+                    while (iter.next()) |stream_name| {
+                        const trimmed = std.mem.trim(
+                            u8,
+                            stream_name,
+                            &std.ascii.whitespace,
+                        );
+
+                        if (trimmed.len > 0) {
+                            // Heap-allocate the string to ensure it outlives parseArgs()
+                            const owned = try allocator.dupe(u8, trimmed);
+                            try stream_list.append(allocator, owned);
+                        }
+                    }
+
+                    streams = try stream_list.toOwnedSlice(allocator);
                 }
             } else if (std.mem.eql(u8, arg, "--port")) {
                 if (args.next()) |value| {
@@ -74,7 +93,7 @@ pub const Args = struct {
         }
 
         return Args{
-            .stream_name = stream_name,
+            .streams = streams,
             .http_port = http_port,
             .slot_name = slot_name,
             .publication_name = publication_name,

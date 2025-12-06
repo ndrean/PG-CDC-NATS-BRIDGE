@@ -63,6 +63,9 @@ services:
         echo 'Creating NATS JetStream stream: CDC'
         nats stream add CDC --server=nats://nats-server:4222 --subjects='cdc.>' --storage=file --retention=limits --max-age=1m --max-msgs=1000000 --max-bytes=1G --replicas=1 --defaults
         echo 'Stream CDC created successfully'
+        echo 'Creating NATS JetStream stream: SCHEMA'
+        nats stream add SCHEMA --server=nats://nats-server:4222 --subjects='schema.>' --storage=file --retention=limits --max-msgs=1000 --max-bytes=10M --replicas=1 --defaults
+        echo 'Stream SCHEMA created successfully'
     restart: "no"
 
 volumes:

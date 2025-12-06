@@ -12,7 +12,8 @@ defmodule Consumer.Application do
       {PgProducer, args()},
       {Gnat.ConnectionSupervisor, gnat_supervisor_settings()},
       # JetStream pull consumer for CDC events
-      {Consumer.CdcConsumer, consumer_settings()}
+      {Consumer.Cdc, consumer_cdc_settings()},
+      {Consumer.Schema, consumer_schema_settings()}
     ]
 
     opts = [strategy: :one_for_one, name: Consumer.Supervisor]
@@ -20,15 +21,21 @@ defmodule Consumer.Application do
   end
 
   def setup_jet_stream do
-    name = System.get_env("NATS_STREAM_NAME") || "cdc_rt"
+    {:ok, %{created: _}} =
+      Gnat.Jetstream.API.Stream.create(:gnat, %Gnat.Jetstream.API.Stream{
+        name: "CDC",
+        subjects: ["cdc.>"]
+      })
+
+    {:ok, %{created: _}} = Gnat.Jetstream.API.Stream.info(:gnat, "CDC")
 
     {:ok, %{created: _}} =
       Gnat.Jetstream.API.Stream.create(:gnat, %Gnat.Jetstream.API.Stream{
-        name: name,
-        subjects: [name <> ".>"]
+        name: "SCHEMA",
+        subjects: ["schema.>"]
       })
 
-    {:ok, %{created: _}} = Gnat.Jetstream.API.Stream.info(:gnat, name)
+    {:ok, %{created: _}} = Gnat.Jetstream.API.Stream.info(:gnat, "SCHEMA")
   end
 
   defp get_tables do
@@ -47,17 +54,29 @@ defmodule Consumer.Application do
     ]
   end
 
-  defp consumer_settings do
+  defp consumer_cdc_settings do
     %Gnat.Jetstream.API.Consumer{
       # consumer position tracking is persisted
-      durable_name: System.get_env("NATS_CONSUMER_NAME") || "cdc_consumer",
-      stream_name: System.get_env("NATS_STREAM_NAME") || "cdc_rt",
+      durable_name: "ex_cdc_consumer",
+      stream_name: "CDC",
       ack_policy: :explicit,
       # 60 seconds in nanoseconds
       ack_wait: 60_000_000_000,
       max_deliver: 3,
-      filter_subject:
-        (System.get_env("NATS_STREAM_NAME") |> String.downcase() || "cdc_rt") <> ".>"
+      filter_subject: "cdc.>"
+    }
+  end
+
+  defp consumer_schema_settings do
+    %Gnat.Jetstream.API.Consumer{
+      # consumer position tracking is persisted
+      durable_name: "ex_schema_consumer",
+      stream_name: "SCHEMA",
+      ack_policy: :explicit,
+      # 60 seconds in nanoseconds
+      ack_wait: 60_000_000_000,
+      max_deliver: 3,
+      filter_subject: "schema.>"
     }
   end
 

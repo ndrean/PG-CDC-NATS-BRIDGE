@@ -60,6 +60,7 @@ pub const CDCEvent = struct {
     table: []const u8,
     operation: []const u8,
     msg_id: []const u8,
+    relation_id: u32, // PostgreSQL relation OID (for schema version tracking)
     data: ?std.ArrayList(pgoutput.Column),
     lsn: u64, // WAL LSN for this event
 
@@ -136,6 +137,7 @@ pub const BatchPublisher = struct {
         table: []const u8,
         operation: []const u8,
         msg_id: []const u8,
+        relation_id: u32,
         data: ?std.ArrayList(pgoutput.Column),
         lsn: u64,
     ) !void {
@@ -158,6 +160,7 @@ pub const BatchPublisher = struct {
             .table = owned_table,
             .operation = owned_operation,
             .msg_id = owned_msg_id,
+            .relation_id = relation_id,
             .data = data,
             .lsn = lsn,
         };
@@ -261,6 +264,7 @@ pub const BatchPublisher = struct {
             try event_map.mapPut("table", try msgpack.Payload.strToPayload(event.table, self.allocator));
             try event_map.mapPut("operation", try msgpack.Payload.strToPayload(event.operation, self.allocator));
             try event_map.mapPut("msg_id", try msgpack.Payload.strToPayload(event.msg_id, self.allocator));
+            try event_map.mapPut("relation_id", msgpack.Payload{ .int = @intCast(event.relation_id) });
 
             // Add column data if present
             if (event.data) |columns| {
@@ -347,6 +351,7 @@ pub const BatchPublisher = struct {
                 try event_map.mapPut("table", try msgpack.Payload.strToPayload(event.table, encoding_allocator));
                 try event_map.mapPut("operation", try msgpack.Payload.strToPayload(event.operation, encoding_allocator));
                 try event_map.mapPut("msg_id", try msgpack.Payload.strToPayload(event.msg_id, encoding_allocator));
+                try event_map.mapPut("relation_id", msgpack.Payload{ .int = @intCast(event.relation_id) });
 
                 // Add column data if present
                 if (event.data) |columns| {

@@ -1,8 +1,8 @@
-defmodule Consumer.Cdc do
+defmodule Consumer.Schema do
   @moduledoc """
-  JetStream pull consumer for CDC events from the Zig bridge.
+  JetStream pull consumer for Schema events from the Zig bridge.
 
-  Consumes CDC events from the CDC_BRIDGE JetStream stream with:
+  Consumes Schema events from the SCHEMA JetStream stream with:
   - Durable consumer tracking
   - Acknowledgment of processed messages
   - Automatic stream/consumer creation
@@ -35,26 +35,27 @@ defmodule Consumer.Cdc do
     try do
       # Decode MessagePack payload
       decoded = Msgpax.unpack!(message.body)
+      dbg(decoded)
 
-      cond do
-        is_list(decoded) ->
-          # Batch of events - each event has table, operation, subject, msg_id, and data
-          Enum.each(decoded, fn event ->
-            data_str = if event["data"], do: " data=#{inspect(event["data"])}", else: ""
+      # cond do
+      #   is_list(decoded) ->
+      #     # Batch of events - each event has table, operation, subject, msg_id, and data
+      #     Enum.each(decoded, fn event ->
+      #       data_str = if event["data"], do: " data=#{inspect(event["data"])}", else: ""
 
-            Logger.info(
-              "[CDC Consumer] Batch event - table: #{event["table"]}, operation: #{event["operation"]}, msg_id: #{event["msg_id"]}#{data_str}"
-            )
-          end)
+      #       Logger.info(
+      #         "[CDC Consumer] Batch event - table: #{event["table"]}, operation: #{event["operation"]}, msg_id: #{event["msg_id"]}#{data_str}"
+      #       )
+      #     end)
 
-        true ->
-          # Single event with table, operation, and data fields
-          data_str = if decoded["data"], do: " data=#{inspect(decoded["data"])}", else: ""
+      #   true ->
+      #     # Single event with table, operation, and data fields
+      #     data_str = if decoded["data"], do: " data=#{inspect(decoded["data"])}", else: ""
 
-          Logger.info(
-            "[CDC Consumer] #{message.topic}: table=#{decoded["table"]}, operation=#{decoded["operation"]}#{data_str}"
-          )
-      end
+      #     Logger.info(
+      #       "[CDC Consumer] #{message.topic}: table=#{decoded["table"]}, operation=#{decoded["operation"]}#{data_str}"
+      #     )
+      # end
 
       # Acknowledge successful processing
       {:ack, state}
