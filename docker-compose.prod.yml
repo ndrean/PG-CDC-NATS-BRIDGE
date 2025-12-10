@@ -25,7 +25,7 @@ services:
         set -ex
         echo "[bridge-init] Command section started!"
         echo "[bridge-init] Waiting for Postgres to be ready..."
-        until pg_isready -h $${PGHOST} -p $${PGPORT} -U $${PGUSER}; do
+        until pg_isready -h $${PG_HOST} -p $${PG_PORT} -U $${PG_USER}; do
           echo "  Postgres not ready, waiting..."
           sleep 2
         done
