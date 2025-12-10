@@ -64,7 +64,6 @@ Consumers subscribe to the stream `INIT` and will receive on connection:
 }%
 ```
 
-
 ```sh
 ./bridge --port 9090 --table tab_1,tab_2 --stream CDC,INIT --slot bridge
 ```
@@ -72,6 +71,20 @@ Consumers subscribe to the stream `INIT` and will receive on connection:
 > [!NOTE] PostgreSQL replication slots are single threaded. If you need more replicas, open another port and another slot.
 
 It provides basic telemetry to monitor the WAL lag size, via logs to SDTOUT and Prometheus ready at the endpoint ":9090/metrics".
+
+## Test
+
+```sh
+docker compose -f docker-compose.prod.yml --env-file .env.prod up --build -d
+```
+
+```sh
+docker compose -f docker-compose.prod.yml --env-file .env.prod up postgres nats-server nats-init nats-conf-gen
+```
+
+```sh
+docker compose -f docker-compose.prod.yml --env-file .env.prod up bridge-init bridge --build -d
+```
 
 ## Setup/Features
 
@@ -223,8 +236,6 @@ flowchart TB
    - **Stream persistence**: `.storage = .file` (Zig/NATS)
    - **Consumer position**: `durable_name` (Elixir/Gnat)
    - Both survive restarts
-
-## Features
 
 - PostgreSQL logical replication setup (replication slots & publications)
 - NATS JetStream integration for reliable message streaming

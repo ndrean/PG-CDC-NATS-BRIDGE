@@ -21,6 +21,7 @@ pub const AsyncBatchPublisher = struct {
     // Atomic state shared between threads
     last_confirmed_lsn: std.atomic.Value(u64), // Last LSN confirmed by NATS
     fatal_error: std.atomic.Value(bool), // Set when NATS reconnection fails
+    flush_complete: std.atomic.Value(bool), // Set when flush thread finishes final flush
 
     // Flush thread
     flush_thread: ?std.Thread,
@@ -42,6 +43,7 @@ pub const AsyncBatchPublisher = struct {
             .event_queue = event_queue,
             .last_confirmed_lsn = std.atomic.Value(u64).init(0),
             .fatal_error = std.atomic.Value(bool).init(false),
+            .flush_complete = std.atomic.Value(bool).init(false),
             .flush_thread = null,
             .should_stop = std.atomic.Value(bool).init(false),
         };
@@ -169,6 +171,11 @@ pub const AsyncBatchPublisher = struct {
         return self.fatal_error.load(.seq_cst);
     }
 
+    /// Check if the flush thread has completed all pending work
+    pub fn isFlushComplete(self: *AsyncBatchPublisher) bool {
+        return self.flush_complete.load(.seq_cst);
+    }
+
     /// Background thread that continuously drains events from lock-free queue and flushes to NATS
     fn flushLoop(self: *AsyncBatchPublisher) void {
         log.info("ℹ️ Lock-free flush thread started", .{});
@@ -242,10 +249,25 @@ pub const AsyncBatchPublisher = struct {
 
                 last_flush_time = now;
             } else if (batch.items.len == 0) {
-                // No events available, sleep briefly to avoid busy-waiting
+                // No events available
+                // Check if we should stop immediately (no pending work)
+                if (self.should_stop.load(.seq_cst)) {
+                    break;
+                }
+                // Sleep briefly to avoid busy-waiting
                 std.Thread.sleep(1 * std.time.ns_per_ms);
             } else {
-                // Have events but timeout not reached - keep them and sleep briefly
+                // Have events but timeout not reached
+                // If shutting down, flush immediately instead of waiting
+                if (self.should_stop.load(.seq_cst)) {
+                    log.info("Shutdown detected with {d} pending events - flushing now", .{batch.items.len});
+                    self.flushBatch(&batch) catch |err| {
+                        log.err("⚠️ Failed to flush pending batch on shutdown: {}", .{err});
+                    };
+                    current_payload_size = 0;
+                    break;
+                }
+                // Keep them and sleep briefly
                 std.Thread.sleep(1 * std.time.ns_per_ms);
             }
         }
@@ -269,6 +291,10 @@ pub const AsyncBatchPublisher = struct {
                 log.err("⚠️ Failed to flush final batch: {}", .{err});
             };
         }
+
+        // Signal that flush thread has completed all work
+        self.flush_complete.store(true, .seq_cst);
+        log.info("✅ Flush thread completed - all events published", .{});
     }
 
     /// Flush a batch to NATS (runs in flush thread)

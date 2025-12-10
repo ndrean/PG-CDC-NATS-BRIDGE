@@ -24,6 +24,8 @@ services:
       - "-c"
       - "max_wal_senders=10"
       - "-c"
+      - "max_slot_wal_keep_size=10GB"
+      - "-c"
       - "wal_sender_timeout=300s" # 5 min
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U postgres" ]
@@ -33,18 +35,39 @@ services:
     networks:
       - cdc-bridge
 
+  nats-config-gen:
+    image: busybox:latest
+    container_name: nats-config-gen
+    env_file:
+      - .env.prod
+    volumes:
+      - nats-config:/config
+      - ./nats-server.conf.template:/nats-server.conf.template:ro
+    command:
+      - sh
+      - -c
+      - |
+        sed -e "s/\$${NATS_BRIDGE_USER}/$${NATS_BRIDGE_USER}/g" \
+            -e "s/\$${NATS_BRIDGE_PASSWORD}/$${NATS_BRIDGE_PASSWORD}/g" \
+            /nats-server.conf.template > /config/nats-server.conf
+        echo "✓ Generated NATS config with credentials"
+    networks:
+      - cdc-bridge
+    restart: "no"
+
   nats-server:
     image: nats:latest
     container_name: nats-server
+    depends_on:
+      nats-config-gen:
+        condition: service_completed_successfully
     ports:
       - "4222:4222" # Client connections
       - "8222:8222" # HTTP monitoring
-    env_file:
-      - .env.prod
-    command: -js -m 8222 -c /etc/nats/nats-server.conf
     volumes:
       - nats-data:/data
-      - ./nats-server.conf:/etc/nats/nats-server.conf:ro
+      - nats-config:/config:ro
+    command: ["-js", "-m", "8222", "-c", "/config/nats-server.conf"]
     restart: unless-stopped
     networks:
       - cdc-bridge
@@ -91,6 +114,8 @@ volumes:
   postgres-data:
     driver: local
   nats-data:
+    driver: local
+  nats-config:
     driver: local
 
 networks:

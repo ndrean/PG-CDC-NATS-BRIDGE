@@ -1,11 +1,8 @@
-# PostgreSQL Binary Formats
+# Notes on PostgreSQL Binary Formats
 
-This single page gives compact binary layouts you'll need to decode values received from Postgres in *binary mode* (e.g. via libpq/pg protocol). Below that is a *practical Zig decoder* (minimal, opinionated) that demonstrates reading the binary payloads for many common types.
+The binary layouts you have to decode when you receive CDC from Postgres in *binary mode* (e.g. via libpq/pg protocol).
 
----
-
-
-Postgres binary protocol uses **big‑endian** for integer and float wire formats.
+> [!NOTE] Postgres binary protocol uses **big‑endian** for integer and float wire formats.
 
 For variable-length types, most values are encoded as `int32 length` followed by `length` bytes (length = -1 means SQL NULL in many array/composite element encodings).
 
@@ -39,7 +36,7 @@ Many composite formats start with small headers (ndigits, weight for NUMERIC; nd
 
 Binary payload layout (int16 = 2 bytes, big‑endian):
 
-```
+```txt
 int16 ndigits
 int16 weight
 int16 sign       -- 0x0000 pos, 0x4000 neg, 0xC000 NaN
@@ -53,7 +50,7 @@ Interpretation: `digits[0]` is multiplier of `10^(weight*4)`. Each digit is 4 de
 
 ## ARRAY (binary)
 
-```
+```txt
 int32 ndim
 int32 has_null (0/1)
 int32 element_type_oid
@@ -86,7 +83,7 @@ Note: element bytes are themselves *binary representations* of the element type 
 
 Binary representation:
 
-```
+```txt
 uint8 family (AF_INET=4/AF_INET6=6)
 uint8 masklen (prefix length)
 uint8 is_cidr (0/1)

@@ -41,6 +41,8 @@ BEGIN
 END;
 \$\$;
 
+# Create test tables with various data types for testing
+
 CREATE TABLE IF NOT EXISTS test_types (
   id SERIAL PRIMARY KEY,
   uid UUID DEFAULT gen_random_uuid(),

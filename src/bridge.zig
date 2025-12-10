@@ -35,8 +35,6 @@ fn initStreams(
         try nats_publisher.ensureStream(publisher.js.?, allocator, stream_name);
         log.info("  ✅ Stream '{s}' verified", .{stream_name});
     }
-
-    // log.info("✅ All NATS JetStream streams verified\n", .{});
 }
 
 /// Helper to process and publish a CDC event (INSERT/UPDATE/DELETE)
@@ -676,6 +674,55 @@ pub fn main() !void {
             metrics.recordReconnect();
             metrics.setConnected(true);
         }
+    }
+
+    // Graceful shutdown: signal flush thread to stop and wait for completion
+    log.info("\n🛑 Shutdown initiated - signaling flush thread to stop...", .{});
+
+    // CRITICAL: Signal should_stop BEFORE waiting for completion
+    batch_pub.should_stop.store(true, .seq_cst);
+
+    const initial_queue_len = batch_pub.event_queue.len();
+    if (initial_queue_len > 0) {
+        log.info("📤 Queue has {d} events waiting to be published...", .{initial_queue_len});
+    }
+
+    const shutdown_timeout_seconds = 30;
+    const start_time = std.time.timestamp();
+    var last_log_time: i64 = 0;
+
+    // Wait for flush thread to complete (both queue empty AND final flush done)
+    while (!batch_pub.isFlushComplete()) {
+        const elapsed = std.time.timestamp() - start_time;
+        if (elapsed > shutdown_timeout_seconds) {
+            const remaining = batch_pub.event_queue.len();
+            log.warn("⚠️ Shutdown timeout reached - {d} events may not have been published", .{remaining});
+            break;
+        }
+
+        // Log progress every second
+        if (elapsed - last_log_time >= 1) {
+            const remaining = batch_pub.event_queue.len();
+            if (remaining > 0 or !batch_pub.isFlushComplete()) {
+                log.info("📊 Draining: {d} events in queue, flush thread working...", .{remaining});
+            }
+            last_log_time = elapsed;
+        }
+
+        std.Thread.sleep(100 * std.time.ns_per_ms); // 100ms
+    }
+
+    if (batch_pub.isFlushComplete()) {
+        log.info("✅ Flush thread completed - all events published to NATS", .{});
+    }
+
+    // Send final ACK to PostgreSQL with last confirmed LSN
+    const final_lsn = batch_pub.getLastConfirmedLsn();
+    if (final_lsn > last_ack_lsn) {
+        pg_stream.sendStatusUpdate(final_lsn) catch |err| {
+            log.warn("Failed to send final ACK: {}", .{err});
+        };
+        log.info("📨 Final ACK sent to PostgreSQL: LSN {x}", .{final_lsn});
     }
 
     log.info("\n=== Bridge Session Summary ------------------------------", .{});

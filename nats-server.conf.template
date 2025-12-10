@@ -1,4 +1,6 @@
-# NATS Server Configuration for CDC Testing
+# NATS Server Configuration Template
+# This file uses environment variable placeholders: ${NATS_BRIDGE_USER}, ${NATS_BRIDGE_PASSWORD}
+# The nats-config-gen container automatically generates the final config at startup
 port: 4222
 
 # Enable JetStream
@@ -25,7 +27,7 @@ accounts {
       max_consumers: 10
     }
     users: [
-      { user: "bridge_user", password: "bridge_secure_password" }
+      { user: "${NATS_BRIDGE_USER}", password: "${NATS_BRIDGE_PASSWORD}" }
     ]
   }
 }
