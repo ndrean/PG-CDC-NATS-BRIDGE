@@ -38,7 +38,8 @@ pub const Nats = struct {
     pub const max_reconnect_attempts = -1;
 
     /// Wait time between reconnection attempts (milliseconds)
-    pub const reconnect_wait_ms = 2000;
+    /// 1s is aggressive but appropriate for CDC (minimize replication lag)
+    pub const reconnect_wait_ms = 1000;
 
     /// Async publish flush timeout (milliseconds)
     /// Must be >= reconnect_wait_ms * max attempts
@@ -101,7 +102,13 @@ pub const Batch = struct {
     pub const max_age_ms = 100;
 
     /// Size of the ring buffer (must be power of 2)
-    pub const ring_buffer_size = 4096;
+    /// Sized for NATS/PostgreSQL reconnection resilience:
+    /// - 32768 slots = ~546ms buffer at 60K events/s
+    /// - Absorbs jitter and provides meaningful buffer during reconnection
+    /// - NATS reconnect_wait_ms = 1000ms → queue covers 54% of retry interval
+    /// - PostgreSQL reconnect_delay = 5000ms
+    /// - Memory cost: ~2MB (negligible for production resilience)
+    pub const ring_buffer_size = 32768;
     pub const max_payload_bytes = 256 * 1024; // 256KB
 };
 

@@ -5,6 +5,7 @@ set -ex  # Added -x for debugging
 BRIDGE_READER="${POSTGRES_BRIDGE_USER:-bridge_reader}"
 BRIDGE_READER_PASSWORD="${POSTGRES_BRIDGE_PASSWORD:-bridge_password_changeme}"
 TARGET_DB="${TARGET_DB:-postgres}"
+PG_PUB="${BRIDGE_CDC_PUBLICATION}"
 
 echo "=========================================="
 echo "[Bridge Init] Script execution started!"
@@ -35,8 +36,8 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 
 DO \$\$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'cdc_pub') THEN
-        CREATE PUBLICATION cdc_pub FOR ALL TABLES;
+    IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = '${PG_PUB}') THEN
+        CREATE PUBLICATION ${PG_PUB} FOR ALL TABLES;
     END IF;
 END;
 \$\$;

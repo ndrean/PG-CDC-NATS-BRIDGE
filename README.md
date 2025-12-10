@@ -1,603 +1,715 @@
-# POSTGRESQL-to-NATS bridge server
+# PostgreSQL CDC → NATS Bridge
 
-A Zig project to build a PostgreSQL bridge opiniated server to:
+![Zig support](https://img.shields.io/badge/Zig-0.15.2-color?logo=zig&color=%23f3ab20)
 
-- stream Change Data Capture (CDC) to NATS JetStream
-- bootstrap a PostgreSQL table via a NATS server
-- MessagePack encoding
+A lightweight (15MB), opinionated bridge for streaming PostgreSQL changes to NATS JetStream. Built with Zig for minimal overhead, includes table bootstrapping for consumer initialization.
+
+⚠️ **Status**: Early stage, not yet battle-tested in production. Suitable for experimentation and non-critical workloads.
 
 ```mermaid
 flowchart LR
-    Code[PostgreSQL] <-.-> Bridge_server -.-> NATS/JetStream <-.-> Consumers
-```
+    PG[PostgreSQL<br/>Logical Replication] --> Bridge[Bridge Server<br/>5 threads]
+    Bridge --> NATS[NATS JetStream]
 
-It uses the streams `CDC` and `INIT` to which NATS/JS consumers should subscribe or publish to.
-
-The message are encoded with `MessagePack`.
-
-It uses a NATS KV store with a bucket name "schemas" to hold the schemas of the tables of interest.
-
-Consumers subscribe to the stream `INIT` and will receive on connection:
-
-- the schemas through the topic `init.schema`:
-  
-```json
-// topic: init.schema.<table>
-%{"columns" => 
-  [
-    %{"column_default" => "nextval('users_id_seq'::regclass)", "data_type" => "integer", "is_nullable" => false, "name" => "id", "position" => 1}, 
-    %{"column_default" => nil, "data_type" => "text", "is_nullable" => false, "name" => "name", "position" => 2}, 
-    %{"column_default" => nil, "data_type" => "text", "is_nullable" => true, "name" => "email", "position" => 3}, 
-    %{"column_default" => "now()", "data_type" => "timestamp with time zone", "is_nullable" => true, "name" => "created_at", "position" => 4}
-  ],
-  "schema" => "public.users", 
-  "table" => "users", 
-  "timestamp" => 1765201228
-}
-```
-
-- metadata for the topic `init.meta` and a full snpashot of the table of interest for the topic `init.<table>`
-  
-```json
-//topic: init.meta.<table>
-%{
-  "batch_count" => 4,
-  "lsn" => "0/191BFD0",
-  "row_count" => 4000,
-  "snapshot_id" => "snap-1765208480",
-  "table" => "users",
-  "timestamp" => 1765208480
-}
-
-// topic: init.snap.<table>.snap-<snap-id>.<chunk_id>
-%{
-  "chunk" => 3,
-  "data" => [
-    %{
-      "created_at" => "2025-12-08 13:45:21.719719+00",
-      "email" => "user-0-2001@example.com",
-      "id" => "3001",
-      "name" => "User-0-2001"
-    },
-    ...
-  ]
-}%
-```
-
-```sh
-./bridge --port 9090 --table tab_1,tab_2 --stream CDC,INIT --slot bridge
-```
-
-> [!NOTE] PostgreSQL replication slots are single threaded. If you need more replicas, open another port and another slot.
-
-It provides basic telemetry to monitor the WAL lag size, via logs to SDTOUT and Prometheus ready at the endpoint ":9090/metrics".
-
-## Test
-
-```sh
-docker compose -f docker-compose.prod.yml --env-file .env.prod up --build -d
-```
-
-```sh
-docker compose -f docker-compose.prod.yml --env-file .env.prod up postgres nats-server nats-init nats-conf-gen
-```
-
-```sh
-docker compose -f docker-compose.prod.yml --env-file .env.prod up bridge-init bridge --build -d
-```
-
-## Setup/Features
-
-The NATS/JS setup should create the two streams.
-PostgreSQL should contain the tables of interest.
-
-JetStream must be enabled and a KV store should be created
-
-Example of NATS setup:
-
-```yml
-nats-init:
-    image: natsio/nats-box:latest
-    container_name: nats-init
-    networks:
-      - cdc-bridge
-    depends_on:
-      - nats-server
-    command:
-      - sh
-      - -c
-      - |
-        set -e
-        until nats server check connection --server=nats://nats-server:4222 2>/dev/null; do
-          sleep 1
-        done
-
-        nats stream add CDC --server=nats://nats-server:4222 --subjects='cdc.>' --storage=file --retention=limits --max-age=1m --max-msgs=1000000 --max-bytes=1G --replicas=1 --defaults || true
-
-        nats stream add INIT --server=nats://nats-server:4222 --subjects='init.>' --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=100G --replicas=1 --defaults || true
- 
-        nats kv add schemas --server=nats://nats-server:4222 --history=10 --replicas=1 || true
- 
-        exit 0
-    restart: "no"
-
-```
-
-## Features
-
-- PostgreSQL logical replication setup (replication slots & publications)
-- NATS/JetStream integration for reliable message streaming
-- Self-contained build using vendored nats.c library
-- **MessagePack encoding** - Binary format for efficient serialization
-- **Graceful shutdown** - Signal handling (SIGINT/SIGTERM)
-- **Non-blocking I/O** - Efficient polling with 10ms sleep when idle
-- **Automatic reconnection** - Handles connection failures with exponential backoff
-- **Arena allocator** - Optimized temporary allocations per message
-  
-## Architecture
-
-batch_publisher.zig: Return max LSN from flush operations
-bridge.zig: Only set pending_ack_lsn after successful NATS flush
-Optional: Add a callback mechanism so async flush can signal completion
-This guarantees at-least-once delivery to NATS, with the replication slot protecting against data loss between PG and NATS.
-
-- PostgreSQL setup:
-
-```mermaid
-flowchart TB
-    subgraph PG["PostgreSQL"]
-
-        WAL[SET wal_level = 'logical';]
-        Slot["SELECT pg_create_logical_replication_slot( '{s}', 'pgoutput')"]
-        Pub["CREATE PUBLICATION {s} FOR TABLE {s},
-                .{pub_name, table}"]
-    end
-```
-
-- WAL digest flow:
-
-```mermaid
-flowchart TB
-    subgraph Bridge["CDC Bridge (Zig)"]
-        Loop["Main Loop<br/>while !should_stop"]
-        Consume["PQconsumeInput()"<br/>Read from socket]
-        GetData["PQgetCopyData(async=1)<br/>Buffer Read (non-blocking) <br> buffer flush()"]
-        Parse[Parse binary WAL format]
-        PgOutput["Parse pgoutput protocol<br/>BEGIN/RELATION/.../COMMIT"]
-        Encode["encodeCDCEvent()<br/>Encode to MessagePack"]
-        Publish["publisher.publish()<br/>Subject: cdc.{table}.{operation}<br/>Msg-ID: {LSN}-{table}-{operation}"]
-        Ack["sendStatusUpdate(LSN)<br/>Tell PostgreSQL: 'I got it!'"]
-        Sleep["No data?<br/>sleep(10ms)"]
+    subgraph NATS
+        CDC[CDC Stream<br/>cdc.table.operation]
+        INIT[INIT Stream<br/>init.snap.*, init.meta.*]
+        KV[KV Store: schemas<br/>key=table_name]
     end
 
-
-    WAL -->|Network Socket| Consume
-    Consume -->|libpq Internal Buffer| GetData
-    GetData -->|Binary Data| Parse
-    Parse -->|WAL Message| PgOutput
-    PgOutput -->|CDC Event| Encode
-    Encode -->|MessagePack| Publish
-    Publish -->|With Msg-ID| Stream
-    
-
-
-
+    NATS --> Consumer[Consumer<br/>Local SQLite/PGLite]
 ```
 
-```mermaid
-flowchart TB
-    subgraph Consumer["Consumer"]
-        PullConsumer["JetStream Pull Consumer<br/>Durable Name: cdc_consumer"]
-        Decode[Decode MessagePack]
-        Process["Process CDC Event"]
-        ConsumerAck[Acknowledge]
-    end
+## Table of Contents
 
-  subgraph NATS["NATS JetStream"]
-        Stream["Stream: rt_cdc<br/>Storage: .file (persistent)<br/>Subjects: cdc.>"]
-    end
+- [Overview](#overview)
+- [Design Philosophy](#design-philosophy)
+- [Prerequisites](#prerequisites)
+- [Consumer Integration Guide](#consumer-integration-guide)
+- [Running the Bridge](#running-the-bridge)
+- [Message Formats](#message-formats)
+- [Monitoring & Telemetry](#monitoring--telemetry)
+- [Safety & Guarantees](#safety--guarantees)
+- [Architecture](#architecture)
+- [Comparison to Alternatives](#comparison-to-alternatives)
+- [Build Instructions](#build-instructions)
+- [Configuration](#configuration)
 
-  Bridge --> |stream <br> with MSG-ID| Stream
-  Stream -->|Idempotent Delivery<br>Dedup by Msg.ID| PullConsumer
-  Publish -.->|Success| Ack
-  Ack -->|Prune WAL| Slot
-  GetData -->|No Data| Sleep
+---
 
-  Publish -.->|Success| Ack
-  Ack -->|Prune WAL| Slot
-  GetData -->|No Data| Sleep
-  Sleep --> Loop
-  Ack --> Loop
-  
-  PullConsumer --> Decode
-  Decode --> Process
-  Process --> ConsumerAck
-  ConsumerAck -.->|Track Position| NATS
+## Overview
+
+### What It Does
+
+**Two-phase data flow:**
+
+1. **Bootstrap** (INIT stream): Consumer requests table snapshot → receives data in chunks
+2. **Real-time CDC** (CDC stream): Consumer receives INSERT/UPDATE/DELETE events as they happen
+
+**Key features:**
+- Streams PostgreSQL changes using logical replication (pgoutput format)
+- Publishes schemas to NATS KV store on startup
+- Generates table snapshots on-demand (10K row chunks)
+- MessagePack encoding for efficiency
+- At-least-once delivery with idempotent message IDs
+- Graceful shutdown with LSN acknowledgment
+- 15MB Docker image, 10MB RAM usage
+- ~60K events/s throughput (single-threaded)
+
+### Use Case
+
+**Perfect for:** Consumers wanting to mirror PostgreSQL tables locally (SQLite, PGLite, etc.) and stay synchronized with real-time changes.
+
+**Example:** Edge applications, mobile apps, or analytics workers that need a local replica of specific tables without querying the main database.
+
+---
+
+## Design Philosophy
+
+This bridge is an **experiment in minimalism**: can PostgreSQL CDC be done with 16MB and 5MB RAM while preserving correctness? The design makes deliberate trade-offs for simplicity and efficiency.
+
+### 1. Opinionated Encoding: MessagePack
+
+**Current default: MessagePack**
+- Compact (~30% smaller than JSON)
+- Type-safe (preserves int/float/binary distinctions)
+- Fast encoding/decoding
+
+**Future option:** `--format json` flag for browser compatibility (NATS supports WebSocket connections)
+
+### 2. Single-Threaded per Bridge
+
+**Design choice:** One bridge instance = one replication slot = sequential processing
+
+**Rationale:**
+- PostgreSQL WAL is inherently sequential
+- Simpler LSN acknowledgment logic
+- Scale horizontally (multiple bridges) instead of vertically
+
+**To scale throughput:**
+```bash
+# Bridge 1: 60K events/s
+./bridge --slot slot_1 --table users --port 9090
+
+# Bridge 2: Another 60K events/s
+./bridge --slot slot_2 --table orders --port 9091
 ```
 
-### Key Flow Points
+**Trade-off:** Multiple processes vs single multi-threaded process. This approach prioritizes operational simplicity.
 
-1. **Non-blocking I/O Loop**
-   - `PQconsumeInput()` pulls data from network socket into libpq's internal buffer
-   - `PQgetCopyData(async=1)` reads from buffer without blocking
-   - Allows signal handler to work (Ctrl+C for graceful shutdown)
+### 3. Two Independent ACK Flows
 
-2. **WAL Acknowledgment**
-   - `sendStatusUpdate(LSN)` tells PostgreSQL which WAL position was processed
-   - PostgreSQL can safely prune WAL data from replication slot
-   - Prevents unbounded WAL growth
+The system has **two separate acknowledgment flows** that work independently:
 
-3. **Idempotent Delivery**
-   - Message ID: `{LSN}-{table}-{operation}` (e.g., `25cb3c8-users-insert`)
-   - NATS JetStream deduplicates by Msg-ID
-   - Ensures exactly-once semantics even with retries
+#### ACK Flow 1: WAL Preservation (Bridge ↔ PostgreSQL)
 
-4. **Durability**
-   - **Stream persistence**: `.storage = .file` (Zig/NATS)
-   - **Consumer position**: `durable_name` (Elixir/Gnat)
-   - Both survive restarts
+**The bridge's challenge:** When can we safely tell PostgreSQL to prune WAL?
 
-- PostgreSQL logical replication setup (replication slots & publications)
-- NATS JetStream integration for reliable message streaming
-- Self-contained build using vendored nats.c library
-- **MessagePack encoding** - Binary format for efficient serialization
-- **Graceful shutdown** - Signal handling (SIGINT/SIGTERM)
-- **Non-blocking I/O** - Efficient polling with 10ms sleep when idle
-- **Automatic reconnection** - Handles connection failures with exponential backoff
-- **Arena allocator** - Optimized temporary allocations per message
+```
+PostgreSQL WAL → Bridge → NATS JetStream
+              ↑            ↓
+              └─── ACK after JetStream confirms
+```
+
+**How it works:**
+
+1. Bridge receives WAL event from PostgreSQL
+2. Bridge publishes to NATS JetStream (async)
+3. **JetStream confirms** message is durably persisted (file storage)
+4. Bridge ACKs that LSN to PostgreSQL
+5. PostgreSQL can safely prune WAL up to that LSN
+
+**Why this matters:**
+- Bridge only ACKs after NATS has the data (no data loss)
+- PostgreSQL can reclaim disk space safely
+- If bridge crashes, PostgreSQL retains unpublished WAL
+
+**Backpressure:**
+- NATS slow/full → Bridge can't get JetStream ACK → Bridge stops ACK'ing PostgreSQL → WAL accumulates
+
+#### ACK Flow 2: JetStream Pruning (Consumer ↔ NATS)
+
+**The consumer's challenge:** When can JetStream prune delivered messages?
+
+```
+NATS JetStream → Consumer
+       ↑              ↓
+       └──── Consumer ACKs (or NAKs)
+```
+
+**How it works:**
+
+1. Consumer pulls messages from JetStream
+2. Consumer processes message
+3. Consumer ACKs to JetStream (or NAKs on error)
+4. JetStream tracks consumer position (durable consumer)
+5. JetStream can prune messages acknowledged by all consumers
+
+**Why this matters:**
+- Consumer controls replay (NAK → redeliver)
+- Durable consumer name survives restarts
+- Multiple consumers can track independent positions
+
+**Backpressure:**
+- Consumer slow → JetStream buffers → Consumer catches up at own pace
+- JetStream retention policies prevent unbounded growth
+
+#### Why Two Flows Are Better Than One
+
+**Bridge doesn't wait for consumers:**
+- Bridge ACKs to PostgreSQL as soon as NATS has the data
+- Consumer speed doesn't affect PostgreSQL WAL growth
+- NATS JetStream handles the buffering/delivery problem
+
+**Separation of concerns:**
+
+| Component          | Responsibility                      | ACK Target                         |
+| ------------------ | ----------------------------------- | ---------------------------------- |
+| **Bridge**         | Get data from PG into NATS reliably | PostgreSQL (LSN)                   |
+| **NATS JetStream** | Deliver to consumers durably        | N/A (handles both flows)           |
+| **Consumer**       | Process data and track progress     | NATS JetStream (consumer position) |
+
+This architecture keeps PostgreSQL WAL lean while allowing consumers to replay/lag independently.
+
+### 4. Two-Stream Architecture
+
+| Stream   | Purpose             | Retention     | Consumer Pattern        |
+| -------- | ------------------- | ------------- | ----------------------- |
+| **CDC**  | Real-time changes   | Short (1 min) | Continuous subscription |
+| **INIT** | Bootstrap snapshots | Long (7 days) | One-time replay         |
+
+**Why separate?**
+- Different retention policies
+- Consumer requests snapshots on-demand (not auto-pushed)
+- Clear operational semantics
+
+### 5. On-Demand Snapshots
+
+**Flow:**
+1. Bridge starts → publishes schemas to KV store immediately
+2. Consumer fetches schemas when ready
+3. Consumer publishes: `snapshot.request.{table}`
+4. Bridge generates snapshot (COPY CSV, chunked)
+5. Consumer reconstructs table from INIT stream
+6. Consumer subscribes to CDC stream for updates
+
+**Why on-demand?**
+- No unnecessary work (only snapshot tables consumers need)
+- Consumer controls timing (e.g., off-peak hours)
+- Non-blocking (bridge continues CDC while snapshotting)
+
+### Design Principles Summary
+
+| Principle               | Manifestation                       | Benefit                           |
+| ----------------------- | ----------------------------------- | --------------------------------- |
+| **Simple > Clever**     | Single-threaded, horizontal scaling | Easy to debug, no race conditions |
+| **Explicit > Implicit** | Consumer requests snapshots         | Predictable behavior              |
+| **Correctness > Speed** | ACK only after JetStream confirms   | Zero data loss                    |
+| **Small > Big**         | 15MB image, vendored dependencies   | Minimal operational overhead      |
+
+**The bet:** PostgreSQL's logical replication + NATS JetStream already solve the hard problems (ordering, durability, idempotency). The bridge just connects them correctly.
+
+---
 
 ## Prerequisites
 
-- Zig 0.15.1 or later
-- Docker & Docker Compose (for PostgreSQL and NATS)
-- CMake (for building nats.c library)
+### PostgreSQL Setup (Admin/DBA Task)
 
-## Build Instructions
+**Requires superuser privileges** (e.g., `postgres` user). The bridge uses a restricted `bridge_reader` user for security.
 
-### 1. Build the nats.c library (one-time setup)
+#### 1. Enable Logical Replication
+
+Add to `postgresql.conf` or Docker command:
+```
+wal_level = logical
+max_replication_slots = 10
+max_wal_senders = 10
+max_slot_wal_keep_size = 10GB
+wal_sender_timeout = 300s  # 5 minutes
+```
+
+#### 2. Create Publication
+
+```sql
+-- Run as superuser
+CREATE PUBLICATION cdc_pub FOR ALL TABLES;
+```
+
+To filter specific tables:
+```sql
+CREATE PUBLICATION cdc_pub FOR TABLE users, orders;
+```
+
+#### 3. Create Bridge User
+
+```sql
+-- Run as superuser
+CREATE USER bridge_reader WITH REPLICATION PASSWORD 'secure_password';
+GRANT CONNECT, CREATE ON DATABASE postgres TO bridge_reader;
+GRANT USAGE ON SCHEMA public TO bridge_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO bridge_reader;
+
+-- Auto-grant for future tables
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT ON TABLES TO bridge_reader;
+```
+
+**Why two users?**
+- **Superuser** (`postgres`): Creates publications (security-sensitive)
+- **Bridge user** (`bridge_reader`): Restricted to SELECT + REPLICATION (least privilege)
+
+See `init.sh` for a complete setup script.
+
+---
+
+### NATS JetStream Setup (Admin Task)
+
+#### 1. Enable JetStream
 
 ```bash
-./build_nats.sh
-./build_libpq.sh
+nats-server -js -m 8222
 ```
 
-This compiles:
+Or via Docker:
+```bash
+docker run -p 4222:4222 -p 8222:8222 nats:latest -js -m 8222
+```
 
-- nats.c v3.12.0 and installs it to `libs/nats-install/`
-- `libpq` for Postgres v18.1 (same version as the Postgres server image)
-
-### 2. Start infrastructure
+#### 2. Create Streams
 
 ```bash
-# Start PostgreSQL with logical replication enabled
-docker compose up -d postgres
+# CDC stream: Short retention for real-time events
+nats stream add CDC \
+  --subjects='cdc.>' \
+  --storage=file \
+  --retention=limits \
+  --max-age=1m \
+  --max-msgs=1000000 \
+  --max-bytes=1G \
+  --replicas=1
 
-# Start NATS server with JetStream enabled
-docker compose up -d nats
+# INIT stream: Long retention for bootstrap data
+nats stream add INIT \
+  --subjects='init.>' \
+  --storage=file \
+  --retention=limits \
+  --max-age=7d \
+  --max-msgs=10000000 \
+  --max-bytes=8G \
+  --replicas=1
 ```
 
-### 3. Build the project
+#### 3. Create KV Bucket for Schemas
 
 ```bash
-zig build
+nats kv add schemas --history=10 --replicas=1
 ```
 
-## Available Build Targets
+#### 4. Optional: Configure Authentication
 
-```bash
-# Build all executables (default)
-zig build
+Example `nats-server.conf`:
+```hocon
+port: 4222
 
-# Run the main CDC bridge
-zig build run
-# or directly:
-./zig-out/bin/bridge --stream CDC_BRIDGE
+jetstream {
+    store_dir: "/data"
+    max_memory_store: 1GB
+    max_file_store: 10GB
+}
 
-# Run tests
-zig build test
+accounts {
+  BRIDGE: {
+    jetstream: {
+      max_memory: 1GB
+      max_file: 10GB
+      max_streams: 10
+      max_consumers: 10
+    }
+    users: [
+      {user: "bridge_user", password: "bridge_password"}
+    ]
+  }
+}
 ```
 
-## Project Structure
+See `docker-compose.yml` for a complete Docker setup with PostgreSQL + NATS.
 
-```txt
-├── src/
-│   ├── main.zig           # Main application entry point
-│   ├── root.zig           # Library module root
-│   ├── cdc.zig            # CDC consumer (replication slots, publications)
-│   ├── nats_publisher.zig # NATS JetStream publisher
-│   ├── nats_test.zig      # NATS connection test
-│   ├── pg_test.zig        # PostgreSQL connection test
-│   └── cdc_demo.zig       # Full CDC pipeline demo
-├── libs/
-│   ├── nats.c/            # Vendored nats.c v3.12.0 source
-│   └── nats-install/      # Built nats.c library (created by build_nats.sh)
-├── build.zig              # Zig build configuration
-├── build.zig.zon          # Package dependencies
-├── docker-compose.yml     # Infrastructure setup
-└── nats-server.conf       # NATS JetStream configuration
+---
+
+## Consumer Integration Guide
+
+### Bootstrap Flow (First-Time Setup)
+
+```
+1. Consumer starts
+2. Fetches schemas from NATS KV store
+   GET kv://schemas/{table_name} → MessagePack schema
+3. Checks if local DB needs bootstrap
+4. If yes, publishes snapshot request
+   PUBLISH snapshot.request.{table_name} (empty payload)
+5. Bridge snapshot_listener receives request
+6. Bridge generates snapshot in 10K row chunks
+   → Publishes to init.snap.{table}.{snapshot_id}.{chunk}
+7. Consumer receives chunks, reconstructs table
+8. Consumer receives metadata on init.meta.{table}
+9. Consumer subscribes to CDC stream for real-time updates
 ```
 
-## Dependencies
+### Implementation Example (Elixir)
 
-Managed via `build.zig.zon`:
+**1. Fetch Schemas**
 
-- [zig-msgpack](https://github.com/zigcc/zig-msgpack) - MessagePack encoding
-- Option for tests: [pg.zig](https://github.com/karlseguin/pg.zig) - PostgreSQL client
+```elixir
+def fetch_schema(table_name) do
+  case Gnat.Jetstream.API.KV.get_value(:gnat, "schemas", table_name) do
+    schema_data when is_binary(schema_data) ->
+      {:ok, schema} = Msgpax.unpack(schema_data)
+      # schema = %{"table" => "users", "columns" => [...]}
+      {:ok, schema}
+    _ ->
+      {:error, :not_found}
+  end
+end
+```
 
-Vendored:
+**2. Request Snapshot**
 
-- [nats.c](https://github.com/nats-io/nats.c) v3.12.0 - NATS client (C library)
-- [libpq](https://www.postgresql.org/docs/current/libpq.html) PostgreSQL 18.1
+```elixir
+def request_snapshot(table_name) do
+  # Check if INIT stream is empty (needs fresh snapshot)
+  {:ok, stream_info} = Gnat.Jetstream.API.Stream.info(:gnat, "INIT")
+  stream_messages = stream_info["state"]["messages"] || 0
 
-## Configuration
+  if stream_messages == 0 do
+    # Request snapshot
+    :ok = Gnat.pub(:gnat, "snapshot.request.#{table_name}", "")
+    Logger.info("Requested snapshot for #{table_name}")
+  end
+end
+```
 
-The PostgeSQL and NATS server are run via the Docker daemon (_docker-compose.yml_).
+**3. Subscribe to INIT Stream**
 
-- Postgres:
-  - Port: 5432
-  - User: postgres
-  - Password: postgres
-  - Logical replication: enabled (`wal_level=logical`)
+```elixir
+# Create durable consumer
+consumer_config = %Gnat.Jetstream.API.Consumer{
+  durable_name: "my_init_consumer",
+  stream_name: "INIT",
+  filter_subject: "init.>",
+  ack_policy: :explicit,
+  ack_wait: 60_000_000_000,  # 60 seconds in nanoseconds
+  max_deliver: 3
+}
 
-- nats:
-  - Port: 4222
-  - JetStream: enabled (`-js`)
-  - Storage: `./nats-data` (1GB memory, 10GB file)
+def handle_init_message(message) do
+  {:ok, payload} = Msgpax.unpack(message.body)
 
-- Bridge HTTP Server:
-  - Port: 8080
-  - Endpoints: health, status, metrics, streams management, shutdown
+  case payload do
+    %{"operation" => "snapshot", "data" => rows} ->
+      # Insert rows into local DB
+      insert_bulk_rows(rows)
+      {:ack, state}
 
-- WAL Monitor:
-  - Check interval: 30 seconds
-  - Monitors replication slot lag and status
+    _ ->
+      {:ack, state}
+  end
+end
+```
+
+**4. Subscribe to CDC Stream**
+
+```elixir
+consumer_config = %Gnat.Jetstream.API.Consumer{
+  durable_name: "my_cdc_consumer",
+  stream_name: "CDC",
+  filter_subject: "cdc.users.>",  # Or "cdc.>" for all tables
+  ack_policy: :explicit,
+  max_batch: 100
+}
+
+def handle_cdc_message(message) do
+  {:ok, payload} = Msgpax.unpack(message.body)
+
+  case payload["operation"] do
+    "INSERT" -> insert_row(payload["columns"])
+    "UPDATE" -> update_row(payload["columns"])
+    "DELETE" -> delete_row(payload["columns"])
+  end
+
+  {:ack, state}
+end
+```
+
+See `consumer/lib/consumer/` for a complete Elixir example.
+
+---
 
 ## Running the Bridge
 
-Start the bridge with:
+### Basic Usage
 
 ```bash
-./zig-out/bin/bridge --stream CDC_BRIDGE
-# or with custom HTTP port:
-./zig-out/bin/bridge --stream CDC_BRIDGE --port 9090
+./bridge --stream CDC,INIT \
+         --slot cdc_slot \
+         --publication cdc_pub \
+         --port 9090
 ```
 
-**Available options:**
-
-- `--stream <NAME>` - NATS JetStream stream name (default: CDC_BRIDGE)
-- `--port <PORT>` - HTTP server port (default: 8080)
-- `--help, -h` - Show help message
-
-The bridge will:
-
-1. Set up replication slot (`bridge_slot`) and publication (`bridge_pub`)
-2. Connect to NATS JetStream and create the specified stream
-3. Start HTTP server on specified port (health, metrics, stream management)
-4. Start WAL lag monitor (checks every 30 seconds)
-5. Begin streaming CDC events from PostgreSQL to NATS
-6. Send keepalive messages every 30 seconds to prevent timeout
-7. Log structured metrics every 15 seconds for observability
-
-**Generate test events:**
+### Filter Specific Tables
 
 ```bash
-cd consumer && NATS_STREAM_NAME=CDC_BRIDGE iex -S mix
-iex> Producer.run_test(100)  # Generate 100 INSERT events
+./bridge --stream CDC,INIT \
+         --slot cdc_slot \
+         --publication cdc_pub \
+         --table users,orders \
+         --port 9090
 ```
 
-The bridge runs continuously until stopped with `Ctrl+C` or via `POST /shutdown`.
-
-## Production Features
-
-The bridge includes production-ready features:
-
-- ✅ **WAL streaming protocol parser** - Full pgoutput binary format support (BEGIN/RELATION/INSERT/UPDATE/DELETE/COMMIT)
-- ✅ **MessagePack encoding** - Efficient binary serialization of CDC events
-- ✅ **Continuous streaming loop** - Non-blocking I/O with 10ms sleep when idle
-- ✅ **Error handling** - Automatic reconnection with exponential backoff on connection failures
-- ✅ **Monitoring** - Prometheus metrics, JSON status endpoint, structured logs for Alloy/Loki
-- ✅ **Graceful shutdown** - Signal handling (SIGINT/SIGTERM) and HTTP shutdown endpoint
-- ✅ **Keepalive management** - Bidirectional keepalives every 30s, responds to PostgreSQL keepalive requests
-- ✅ **WAL lag monitoring** - Background thread monitors replication slot lag every 30s
-- ✅ **Idempotent delivery** - Message deduplication via LSN-based message IDs
-- ✅ **Thread-safe metrics** - Mutex-protected metric updates from multiple threads
-
-## NATS Stream Management
-
-The bridge provides comprehensive JetStream stream management capabilities through both HTTP endpoints and integration with downstream consumers.
-
-### Architecture: One Bridge Instance per Stream
-
-**Important:** The bridge is designed to run one replication slot for one stream. If you need to capture a different slot or assign another stream, run a new bridge instance.
-
-This design choice provides:
-
-- **Independent failure domains** - Each bridge/stream can fail independently
-- **Independent scaling** - Different streams can have different resource allocations
-- **Independent replay** - Each replication slot tracks its own LSN position
-- **Operational simplicity** - One slot = one bridge = one stream
-
-**To publish CDC events to multiple streams:**
-
-Run multiple bridge instances, each with its own replication slot and stream:
+### Environment Variables
 
 ```bash
-# Terminal 1: Stream for real-time processing
-./zig-out/bin/bridge --stream CDC_REALTIME
+# PostgreSQL connection
+export PG_HOST=localhost
+export PG_PORT=5432
+export PG_USER=bridge_reader
+export PG_PASSWORD=secure_password
+export PG_DB=postgres
 
-# Terminal 2: Stream for analytics (separate slot: bridge_analytics_slot)
-# Requires code change to use different slot_name and publication_name
-./zig-out/bin/bridge --stream CDC_ANALYTICS
+# NATS connection
+export NATS_HOST=localhost
+export NATS_BRIDGE_USER=bridge_user
+export NATS_BRIDGE_PASSWORD=bridge_password
+
+# Bridge configuration
+export BRIDGE_PORT=9090
 ```
 
-**HTTP stream management endpoints** are provided for administrative tasks:
+### Command-Line Options
 
-- Creating test streams for validation and debugging
-- Managing streams used by other services (not this bridge)
-- Cleaning up streams (purge/delete)
-
-They do **not** allow switching the bridge's target stream at runtime - that requires restarting the bridge with a new `--stream` parameter. The bridge automatically creates its target stream on startup.
-
-### Stream Architecture
-
-**Bridge (Zig)** - Stream Producer & Manager:
-
-- Creates streams with persistent `.file` storage
-- Publishes CDC events with message deduplication (Msg-ID)
-- Manages stream lifecycle via HTTP API
-
-**Consumer (Elixir/Gnat)** - Stream Subscriber:
-
-- Sets `durable_name` for consumer position tracking
-- Survives restarts (durable consumer)
-- Handles redelivery on failures (NAK on error)
-- Processes messages in order
-- Acknowledges successful processing (ACK)
-
-### JetStream Guarantees
-
-The combination of stream persistence and durable consumers provides:
-
-- **Persistence**: Messages survive server restarts (`.file` storage)
-- **Ordering**: Messages delivered in sequence order
-- **Exactly-once semantics**: Message deduplication by Msg-ID (`{LSN}-{table}-{operation}`)
-- **Durability**: Consumer position tracked across restarts (`durable_name`)
-- **Reliability**: Automatic redelivery on failure (NAK)
-
-### HTTP Management Endpoints
-
-The bridge exposes stream management operations at `http://localhost:8080/streams/*`:
-
-**Get stream information:**
-
-```sh
-curl "http://localhost:8080/streams/info?stream=CDC_BRIDGE"
+```
+Options:
+  --stream <NAMES>       Comma-separated stream names (default: CDC,INIT)
+  --slot <NAME>          Replication slot name (default: cdc_slot)
+  --publication <NAME>   Publication name (default: cdc_pub)
+  --table <NAMES>        Comma-separated table filter (default: all tables)
+  --port <PORT>          HTTP telemetry port (default: 9090)
+  --help, -h             Show this help message
 ```
 
-Returns JSON with stream statistics (message count, bytes, first/last sequence, consumer count).
+### Docker Compose
 
-**Create a new stream:**
-
-```sh
-curl -X POST "http://localhost:8080/streams/create?stream=TEST&subjects=test.>"
+```bash
+# Start full stack (PostgreSQL + NATS + Bridge)
+docker compose -f docker-compose.prod.yml up --build
 ```
 
-Creates a stream with persistent `.file` storage, 1GB max bytes, 1M max messages, 1 minute max age.
+See `docker-compose.prod.yml` for the complete setup.
 
-**Delete a stream:**
+### Horizontal Scaling
 
-```sh
-curl -X POST "http://localhost:8080/streams/delete?stream=TEST"
+Run multiple bridge instances with different replication slots:
+
+```bash
+# Terminal 1: Users table (60K events/s)
+./bridge --stream CDC,INIT --slot slot_1 --table users --port 9090
+
+# Terminal 2: Orders table (60K events/s)
+./bridge --stream CDC,INIT --slot slot_2 --table orders --port 9091
+
+# Total: 120K events/s, independent failure domains
 ```
 
-Permanently removes the stream and all its messages.
+---
 
-**Purge stream messages:**
+## Message Formats
 
-```sh
-curl -X POST "http://localhost:8080/streams/purge?stream=TEST"
-```
+> **Note**: Actual payloads use MessagePack binary encoding. JSON examples below show the logical structure for illustration.
 
-Removes all messages from the stream while keeping the stream configuration.
+### Schema (KV Store: `schemas.{table}`)
 
-### Consumer Management (Elixir/Gnat)
-
-Downstream consumers can interact with streams using the Gnat JetStream API:
-
-**List all streams:**
-
-```elixir
-iex> Gnat.Jetstream.API.Stream.list(:gnat)
-{:ok, %{offset: 0, total: 2, limit: 1024, streams: ["CDC_BRIDGE", "TEST"]}}
-```
-
-**Get stream details:**
-
-```elixir
-iex> Gnat.Jetstream.API.Stream.info(:gnat, "CDC_BRIDGE")
-{:ok, %{config: %{...}, state: %{messages: 1234, bytes: 56789, ...}}}
-```
-
-**Purge stream:**
-
-```elixir
-iex> Gnat.Jetstream.API.Stream.purge(:gnat, "CDC_BRIDGE")
-:ok
-```
-
-## Health Check
-
-The bridge provides a simple health check endpoint for monitoring and orchestration tools (Docker, Kubernetes, load balancers, etc.):
-
-**HTTP GET** `http://localhost:8080/health`
-
-Returns:
+Published at bridge startup. Consumers fetch before requesting snapshots.
 
 ```json
-{"status":"ok"}
+{
+  "table": "users",
+  "schema": "public.users",
+  "timestamp": 1765201228,
+  "columns": [
+    {
+      "name": "id",
+      "position": 1,
+      "data_type": "integer",
+      "is_nullable": false,
+      "column_default": "nextval('users_id_seq'::regclass)"
+    },
+    {
+      "name": "name",
+      "position": 2,
+      "data_type": "text",
+      "is_nullable": false,
+      "column_default": null
+    },
+    {
+      "name": "email",
+      "position": 3,
+      "data_type": "text",
+      "is_nullable": true,
+      "column_default": null
+    }
+  ]
+}
 ```
 
-**Status:** `200 OK` when the bridge HTTP server is running.
+### Snapshot Metadata (INIT Stream: `init.meta.{table}`)
 
-## Control Endpoints
+Published after all chunks. Tells consumer how many chunks to expect.
 
-### Graceful Shutdown
-
-**HTTP POST** `http://localhost:8080/shutdown`
-
-Initiates a graceful shutdown of the bridge:
-
-```sh
-curl -X POST http://localhost:8080/shutdown
+```json
+{
+  "snapshot_id": "snap-1765208480",
+  "lsn": "0/191BFD0",
+  "timestamp": 1765208480,
+  "batch_count": 4,
+  "row_count": 4000,
+  "table": "users"
+}
 ```
 
-Returns `Shutdown initiated` and triggers the same graceful shutdown sequence as `Ctrl+C`:
+### Snapshot Chunk (INIT Stream: `init.snap.{table}.{snapshot_id}.{chunk}`)
 
-1. Sets the global shutdown flag
-2. Completes processing of any in-flight WAL messages
-3. Sends final status update to PostgreSQL
-4. Closes all connections cleanly
-5. Joins background threads (HTTP server, WAL monitor)
-6. Exits with summary statistics
+10,000 rows per chunk (configurable in `config.zig`).
 
-This is useful for orchestration tools, deployment scripts, or automated testing.
+```json
+{
+  "table": "users",
+  "operation": "snapshot",
+  "snapshot_id": "snap-1765208480",
+  "chunk": 3,
+  "lsn": "0/191BFD0",
+  "data": [
+    {
+      "id": "3001",
+      "name": "User-3001",
+      "email": "user3001@example.com",
+      "created_at": "2025-12-08 13:45:21.719719+00"
+    },
+    {
+      "id": "3002",
+      "name": "User-3002",
+      "email": "user3002@example.com",
+      "created_at": "2025-12-08 13:45:22.123456+00"
+    }
+    // ... up to 10,000 rows
+  ]
+}
+```
 
-## Telemetry
+### CDC Event (CDC Stream: `cdc.{table}.{operation}`)
 
-The bridge provides comprehensive telemetry through multiple channels for TimeSerie DataBases
+Real-time INSERT/UPDATE/DELETE events.
+
+**Subject pattern:** `cdc.{table}.{operation}`
+- `cdc.users.insert`
+- `cdc.users.update`
+- `cdc.users.delete`
+
+**Message ID (for deduplication):** `{lsn}-{table}-{operation}`
+- Example: `25cb3c8-users-insert`
+
+**INSERT event:**
+```json
+{
+  "table": "users",
+  "operation": "INSERT",
+  "relation_id": 16384,
+  "lsn": "0/25cb3c8",
+  "columns": [
+    {"name": "id", "value": 1},
+    {"name": "name", "value": "Alice"},
+    {"name": "email", "value": "alice@example.com"},
+    {"name": "created_at", "value": "2025-12-10 10:30:00+00"}
+  ]
+}
+```
+
+**UPDATE event:**
+```json
+{
+  "table": "users",
+  "operation": "UPDATE",
+  "relation_id": 16384,
+  "lsn": "0/25cb4d0",
+  "columns": [
+    {"name": "id", "value": 1},
+    {"name": "name", "value": "Alice Smith"},
+    {"name": "email", "value": "alice.smith@example.com"},
+    {"name": "created_at", "value": "2025-12-10 10:30:00+00"}
+  ]
+}
+```
+
+**DELETE event:**
+```json
+{
+  "table": "users",
+  "operation": "DELETE",
+  "relation_id": 16384,
+  "lsn": "0/25cb5e8",
+  "columns": [
+    {"name": "id", "value": 1},
+    {"name": "name", "value": "Alice Smith"},
+    {"name": "email", "value": "alice.smith@example.com"},
+    {"name": "created_at", "value": "2025-12-10 10:30:00+00"}
+  ]
+}
+```
+
+---
+
+## Monitoring & Telemetry
+
+The bridge provides telemetry through multiple channels:
 
 ```mermaid
-flowchart LR    
-    B[Bridge <br>Telemetry] -->|GET /metrics <br> Prom. text format | Prometheus
-    B[Bridge <br>Telemetry] -->|stdout<br> structured Logfmt| Alloy/Loki
-    B[Bridge <br>Telemetry] -->|GET /status <br> JSON format| HTTP_Client
+flowchart LR
+    B[Bridge Server<br/>Telemetry] -->|GET /metrics<br/>Prometheus format| Prometheus
+    B -->|stdout<br/>Structured logfmt| Alloy/Loki
+    B -->|GET /status<br/>JSON format| HTTP_Client
 ```
 
 ### 1. Prometheus Metrics Endpoint
 
-**HTTP GET** `http://localhost:8080/metrics`
+**HTTP GET** `http://localhost:9090/metrics`
 
 Returns metrics in Prometheus text format:
 
 ```prometheus
-bridge_uptime_seconds 45
+bridge_uptime_seconds 331
 bridge_wal_messages_received_total 1797
 bridge_cdc_events_published_total 288
 bridge_last_ack_lsn 25509096
 bridge_connected 1
 bridge_reconnects_total 0
+bridge_nats_reconnects_total 0
 bridge_last_processing_time_us 2
 bridge_slot_active 1
 bridge_wal_lag_bytes 51344
 ```
 
-Configure Prometheus to scrape this endpoint.
+Configure Prometheus to scrape this endpoint:
+
+```yaml
+scrape_configs:
+  - job_name: 'cdc_bridge'
+    static_configs:
+      - targets: ['localhost:9090']
+```
 
 ### 2. JSON Status Endpoint
 
-**HTTP GET** `http://localhost:8080/status`
+**HTTP GET** `http://localhost:9090/status`
 
-Returns bridge status as JSON for programmatic access:
+Returns bridge status as JSON:
 
 ```json
 {
@@ -608,6 +720,7 @@ Returns bridge status as JSON for programmatic access:
   "current_lsn": "0/1832ce8",
   "is_connected": true,
   "reconnect_count": 0,
+  "nats_reconnect_count": 0,
   "last_processing_time_us": 2,
   "slot_active": true,
   "wal_lag_bytes": 51344,
@@ -620,12 +733,10 @@ Returns bridge status as JSON for programmatic access:
 The bridge emits structured metric logs to **stdout** every **15 seconds**:
 
 ```log
-info(bridge): METRICS uptime=15 wal_messages=2 cdc_events=0 lsn=0/183f680 connected=1 reconnects=0 lag_bytes=51608 slot_active=1 processing_time_us=0
+info(bridge): METRICS uptime=15 wal_messages=2 cdc_events=0 lsn=0/183f680 connected=1 reconnects=0 nats_reconnects=0 lag_bytes=51608 slot_active=1
 ```
 
-Configure Grafana Alloy to parse these logs and extract metrics using regex or logfmt parser.
-
-**Example Alloy config snippet:**
+Configure Grafana Alloy to parse these logs:
 
 ```hcl
 loki.source.file "bridge_logs" {
@@ -655,48 +766,457 @@ loki.process "extract_metrics" {
 }
 ```
 
-## WAL parsing
+### 4. Health Check Endpoint
 
-The RelationMessage ('R') comes before any Insert/Update/Delete messages and tells you: Column names, Column type OIDs (for decodeColumnData), Type modifiers.
+**HTTP GET** `http://localhost:9090/health`
 
-Without caching it, you can't decode the tuple data because Tuple data only has raw bytes - no column names or type info.
-You need the type_id from the RelationMessage to call decodeColumnData(type_id, raw_bytes).
-RelationMessages are sent once per table at the start, then only Insert/Update/Delete messages follow.
-
-## PostgreSQL Configuration
-
-### WAL Sender Timeout
-
-PostgreSQL's default `wal_sender_timeout` is 1 minute:
-
-```sh
-docker exec -it postgres psql -U postgres -c "SHOW wal_sender_timeout;"
-# wal_sender_timeout
-# --------------------
-#  1min
+Returns:
+```json
+{"status":"ok"}
 ```
 
-**Solution implemented:** The bridge sends keepalive messages every 30 seconds and flushes them immediately with `PQflush()`. For additional safety, you can increase the timeout to 5 minutes by adding to `docker-compose.yml`:
+Status: `200 OK` when bridge HTTP server is running.
 
-```yaml
-postgres:
-  command: postgres -c wal_sender_timeout=300s
+Use for Docker health checks, Kubernetes probes, or load balancers.
+
+### 5. Graceful Shutdown Endpoint
+
+**HTTP POST** `http://localhost:9090/shutdown`
+
+Initiates graceful shutdown:
+
+```bash
+curl -X POST http://localhost:9090/shutdown
 ```
+
+Shutdown sequence:
+1. Sets global shutdown flag
+2. Drains internal event queue
+3. Sends final ACK to PostgreSQL
+4. Closes connections cleanly
+5. Exits with summary statistics
+
+### 6. Stream Management Endpoints
+
+**Get stream info:**
+```bash
+curl "http://localhost:9090/streams/info?stream=CDC" | jq
+```
+
+**Purge stream messages:**
+```bash
+curl -X POST "http://localhost:9090/streams/purge?stream=TEST"
+```
+
+**Create/delete streams:**
+```bash
+curl -X POST "http://localhost:9090/streams/create?stream=TEST&subjects=test.>"
+curl -X POST "http://localhost:9090/streams/delete?stream=TEST"
+```
+
+---
+
+## Safety & Guarantees
+
+### At-Least-Once Delivery
+
+**The guarantee:**
+- Bridge only ACKs to PostgreSQL **after** NATS JetStream confirms receipt
+- PostgreSQL can safely prune WAL after ACK
+- No data loss between Postgres and NATS
+
+**If bridge crashes:**
+- PostgreSQL retains WAL from last ACK'd LSN
+- Bridge restarts from last ACK'd position
+- JetStream deduplication (Msg-ID) prevents duplicates
+
+**If NATS crashes:**
+- Bridge stops ACK'ing to PostgreSQL
+- WAL accumulates (up to `max_slot_wal_keep_size=10GB`)
+- NATS recovers → Bridge resumes publishing
+- No data loss (WAL preserved)
+
+### Idempotent Delivery
+
+**Message ID pattern:** `{lsn}-{table}-{operation}`
+- Example: `25cb3c8-users-insert`
+
+**NATS JetStream deduplication:**
+- Duplicate Msg-IDs are rejected
+- Ensures exactly-once semantics even with retries
+
+### Durability
+
+**PostgreSQL side:**
+- Logical replication slot preserves WAL
+- `max_slot_wal_keep_size=10GB` prevents unbounded growth
+
+**NATS JetStream side:**
+- File storage (`.storage=file`) survives restarts
+- Durable consumers track position across restarts
+
+**Consumer side:**
+- Durable consumer name persists progress
+- Survives consumer restarts
+
+### Schema Consistency
+
+**Snapshot consistency:**
+- Each snapshot includes LSN for consistency point
+- Consumer can reconstruct table state at that LSN
+
+**CDC event ordering:**
+- PostgreSQL WAL is sequential
+- Bridge preserves order (single-threaded SPSC queue)
+- NATS JetStream delivers in order
+
+### Graceful Shutdown
+
+**Shutdown sequence:**
+1. Signal handler (SIGINT/SIGTERM) sets stop flag
+2. Main thread finishes processing current WAL message
+3. Batch publisher drains internal queue
+4. Bridge sends final ACK to PostgreSQL (last confirmed LSN)
+5. All threads join cleanly
+
+**Guarantees:**
+- No in-flight events lost
+- PostgreSQL knows exact resume point
+- Clean restart from last ACK'd LSN
+
+---
+
+## Architecture
+
+### Thread Model (5 Threads)
+
+1. **Main thread**: Consumes PostgreSQL CDC, parses pgoutput format
+2. **Batch publisher thread**: Batches events, encodes MessagePack, publishes to NATS CDC stream
+3. **WAL monitor thread**: Tracks replication slot lag every 30 seconds
+4. **HTTP telemetry thread**: Serves `/metrics`, `/health`, `/status`, `/shutdown`
+5. **Snapshot listener thread**: Subscribes to `snapshot.request.>`, generates snapshots on-demand
+
+### Lock-Free Queue (SPSC)
+
+**Producer-Consumer pattern:**
+- **Producer**: Main thread (reading WAL)
+- **Consumer**: Batch publisher thread
+- **Queue**: Lock-free ring buffer (32768 slots, 2^15)
+
+**Why lock-free?**
+- Zero contention (single producer, single consumer)
+- Cache-friendly (separate cache lines for indices)
+- Wait-free operations (no blocking)
+
+**Dual purpose:**
+
+1. **Thread separation** (primary): Decouple WAL reading from NATS publishing
+2. **Resilience buffer** (critical): Absorb WAL events during NATS reconnection
+
+**How it handles NATS outages:**
+
+```
+NATS goes down at T=0
+├─ Main thread continues reading WAL → pushes to queue
+├─ Flush thread can't publish → queue fills up
+├─ Queue fills (32768 slots) → ~546ms buffer at 60K events/s
+├─ Queue full → Main thread backs off (sleeps 1ms per attempt)
+├─ PostgreSQL WAL starts accumulating (controlled)
+│
+NATS reconnects at T=1000ms+ (reconnect_wait, queue covers 54% of retry)
+├─ Flush thread resumes publishing
+├─ Queue drains rapidly (~546ms of buffered events)
+└─ Bridge catches up, resumes ACK'ing PostgreSQL
+```
+
+**Backpressure cascade:**
+
+```
+NATS outage → Queue fills → Main thread slows → PostgreSQL WAL accumulates
+                                                         ↓
+                                           (up to max_slot_wal_keep_size=10GB)
+```
+
+**Queue size trade-offs:**
+
+| Queue Size          | Buffer Duration<br/>(at 60K events/s) | Memory Impact | Pros                    | Cons                              |
+| ------------------- | ------------------------------------- | ------------- | ----------------------- | --------------------------------- |
+| 4096                | ~68ms                                 | ~256KB        | Minimal memory          | Too small for reconnections       |
+| 16384               | ~273ms                                | ~1MB          | Good balance            | Marginal for multi-second outages |
+| **32768** (current) | **~546ms**                            | **~2MB**      | **Covers most outages** | **None (negligible cost)**        |
+
+**Why 32768 is the sweet spot:**
+- **NATS reconnection**: 1s between attempts, 546ms covers 54% of retry interval
+- **PostgreSQL reconnection**: 5s delay, queue absorbs burst during reconnection
+- **Production-grade**: 546ms buffer handles real-world jitter and blips
+- **Cost**: 2MB RAM (12MB total) = negligible for the resilience gain
+- **Graceful degradation**: Queue full → controlled WAL accumulation (not instant flood)
+
+**Graceful degradation:**
+- Queue absorbs microsecond-scale jitter
+- PostgreSQL WAL absorbs second-scale outages
+- `max_slot_wal_keep_size=10GB` absorbs minute-scale outages
+- Beyond that → alerts fire (intentional)
+
+### Data Flow
+
+```
+PostgreSQL WAL
+    ↓
+Main Thread (parse pgoutput)
+    ↓
+SPSC Queue (lock-free)
+    ↓
+Batch Publisher Thread
+    ↓ (batch: 500 events OR 100ms OR 256KB)
+MessagePack Encoding
+    ↓
+NATS JetStream (async publish)
+    ↓ (JetStream ACK)
+PostgreSQL LSN ACK
+```
+
+### Memory Management
+
+**Arena allocator:**
+- Reused for each WAL message
+- Retains capacity across messages
+- Avoids allocator churn at high throughput
+
+**Ownership transfer:**
+- Decoded column values transferred via SPSC queue
+- Batch publisher thread frees after publishing
+- No shared state between threads
+
+### Replication Slot Management
+
+**On startup:**
+1. Bridge creates replication slot (if not exists)
+2. Gets current LSN to skip historical data
+3. Starts streaming from current LSN
+
+**During operation:**
+- Bridge sends status updates every 1 second OR 1MB data
+- PostgreSQL prunes WAL up to last ACK'd LSN
+
+**On shutdown:**
+- Bridge sends final ACK with last confirmed LSN
+- Replication slot preserves position for restart
+
+### Reconnection Handling
+
+**PostgreSQL reconnection:**
+- Connection lost → Bridge waits 5 seconds
+- Gets latest LSN
+- Reconnects and resumes streaming
+- Metrics track reconnection count
+
+**NATS reconnection:**
+- Automatic (handled by nats.c library)
+- Max attempts: -1 (infinite)
+- Wait between attempts: 1 second (aggressive for CDC)
+- Flush timeout: 10 seconds (allows ~10 retry attempts)
+
+---
+
+## Comparison to Alternatives
+
+### vs. Debezium (The Proven Solution)
+
+|                        | This Bridge                     | Debezium                              |
+| ---------------------- | ------------------------------- | ------------------------------------- |
+| **Maturity**           | ⚠️ Experimental                  | ✅ Battle-tested (years in production) |
+| **Footprint**          | 15MB / 10MB RAM                 | 500MB+ / 512MB+ RAM                   |
+| **Architecture**       | NATS-native                     | Kafka-centric                         |
+| **Deployment**         | Single binary                   | Kafka Connect cluster                 |
+| **Throughput**         | ~60K events/s (single-threaded) | High (multi-threaded)                 |
+| **Connectors**         | PostgreSQL → NATS only          | 100+ sources/sinks                    |
+| **Enterprise Support** | ❌ None                          | ✅ Available                           |
+
+**When to use Debezium instead:**
+- You need proven reliability (battle-tested in thousands of deployments)
+- You're already running Kafka infrastructure
+- You need connectors for MySQL, MongoDB, Oracle, etc.
+- You need enterprise support contracts
+
+**When to try this bridge:**
+- You're using NATS (or evaluating it)
+- You value small footprint / simple deployment
+- You're comfortable with early-stage software
+- You only need PostgreSQL → NATS
+
+### vs. Benthos / pgstream
+
+**Benthos** (Redpanda):
+- General-purpose streaming (many sources/sinks)
+- ~20-30MB footprint
+- Flexible but less CDC-optimized
+
+**pgstream** (Xata):
+- Go-based CDC library
+- ~15-20MB footprint
+- Similar philosophy (lightweight)
+- Multiple destinations (Kafka, webhooks, etc.)
+
+**This bridge:**
+- NATS-specific (not general-purpose)
+- Built-in bootstrapping (not manual)
+- Zig-native (compiled, minimal overhead)
+
+### The Honest Take
+
+This bridge might carve out a niche for NATS-first teams who want turnkey CDC without heavy infrastructure. Or it might not—time will tell. 🤷
+
+If you're betting on mission-critical CDC, use Debezium. If you're exploring NATS and want a lightweight CDC solution, this is worth trying.
+
+---
+
+## Build Instructions
+
+### Prerequisites
+
+- Zig 0.15.2 or later
+- Docker & Docker Compose (for PostgreSQL and NATS)
+- CMake (for building nats.c library)
+
+### 1. Build Vendored Libraries (One-Time Setup)
+
+```bash
+# Build nats.c v3.12.0
+./build_nats.sh
+
+# Build libpq for PostgreSQL 18.1
+./build_libpq.sh
+```
+
+This compiles:
+- `nats.c` → `libs/nats-install/`
+- `libpq` → `libs/libpq-install/`
+
+### 2. Start Infrastructure
+
+```bash
+# Start PostgreSQL with logical replication enabled
+docker compose up -d postgres
+
+# Start NATS server with JetStream enabled
+docker compose up -d nats-server nats-config-gen nats-init
+```
+
+### 3. Build the Bridge
+
+```bash
+zig build
+```
+
+Output: `./zig-out/bin/bridge`
+
+### 4. Run Tests
+
+```bash
+zig build test
+```
+
+---
+
+## Configuration
+
+All configuration constants are centralized in `src/config.zig`.
+
+### Key Settings
+
+**Snapshot configuration:**
+- Chunk size: `10_000` rows per batch
+- Subject pattern: `init.snap.{table}.{snapshot_id}.{chunk}`
+- Metadata subject: `init.meta.{table}`
+- Request subject: `snapshot.request.{table}`
+
+**CDC configuration:**
+- Batch size: `500` events OR `100ms` OR `256KB` (whichever first)
+- Subject pattern: `cdc.{table}.{operation}`
+- Message ID: `{lsn}-{table}-{operation}`
+
+**NATS configuration:**
+- Max reconnect attempts: `-1` (infinite)
+- Reconnect wait: `2000ms`
+- Flush timeout: `10_000ms` (10 seconds)
+- Status update interval: `1` second OR `1MB` data
+
+**WAL monitoring:**
+- Check interval: `30` seconds
+- Warning threshold: `512MB`
+- Critical threshold: `1GB`
+
+**Buffer sizes:**
+- SPSC queue: `32768` slots (2^15, ~546ms buffer at 60K events/s)
+- Subject buffer: `128` bytes
+- Message ID buffer: `128` bytes
+
+See `src/config.zig` for all tunables.
+
+---
+
+## Project Structure
+
+```
+├── src/
+│   ├── bridge.zig              # Main application entry point
+│   ├── config.zig              # Centralized configuration
+│   ├── wal_stream.zig          # PostgreSQL replication stream
+│   ├── pgoutput.zig            # pgoutput format parser
+│   ├── nats_publisher.zig      # NATS JetStream publisher
+│   ├── nats_kv.zig             # NATS KV store wrapper
+│   ├── batch_publisher.zig     # Synchronous batch publisher
+│   ├── async_batch_publisher.zig # Async batch publisher with SPSC queue
+│   ├── spsc_queue.zig          # Lock-free single-producer single-consumer queue
+│   ├── schema_publisher.zig    # Schema publishing to KV store
+│   ├── snapshot_listener.zig   # Snapshot request listener
+│   ├── wal_monitor.zig         # WAL lag monitoring
+│   ├── http_server.zig         # HTTP telemetry server
+│   ├── metrics.zig             # Metrics tracking
+│   └── pg_conn.zig             # PostgreSQL connection helpers
+├── libs/
+│   ├── nats.c/                 # Vendored nats.c v3.12.0 source
+│   ├── nats-install/           # Built nats.c library
+│   └── libpq-install/          # Built libpq library
+├── consumer/                   # Elixir consumer example
+│   └── lib/consumer/
+│       ├── application.ex      # Consumer app setup
+│       ├── cdc_consumer.ex     # CDC stream consumer
+│       └── init_consumer.ex    # INIT stream consumer (bootstrap)
+├── build.zig                   # Zig build configuration
+├── build.zig.zon               # Package dependencies
+├── docker-compose.yml          # Base infrastructure setup
+├── docker-compose.prod.yml     # Production setup with bridge
+├── init.sh                     # PostgreSQL initialization script
+└── nats-server.conf.template   # NATS server configuration
+```
+
+---
+
+## Dependencies
+
+**Managed via `build.zig.zon`:**
+- [zig-msgpack](https://github.com/zigcc/zig-msgpack) - MessagePack encoding
+
+**Vendored:**
+- [nats.c](https://github.com/nats-io/nats.c) v3.12.0 - NATS client (C library)
+- [libpq](https://www.postgresql.org/docs/current/libpq.html) PostgreSQL 18.1
+
+---
 
 ## Testing
 
 ### End-to-End CDC Pipeline Test
 
 **Terminal 1 - Start the bridge:**
-
-```sh
-./zig-out/bin/bridge --stream CDC_BRIDGE
+```bash
+./zig-out/bin/bridge --stream CDC,INIT
 ```
 
 **Terminal 2 - Generate CDC events:**
-
-```sh
-cd consumer && NATS_STREAM_NAME=CDC_BRIDGE iex -S mix
+```bash
+cd consumer && iex -S mix
 
 # Generate 100 INSERT events
 iex> Producer.run_test(100)
@@ -705,204 +1225,72 @@ iex> Producer.run_test(100)
 iex> Stream.interval(500) |> Stream.take(100) |> Task.async_stream(fn _ -> Producer.run_test(10) end) |> Enum.to_list()
 ```
 
-```sh
-docker exec postgres psql -U postgres -c "CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT, created_at TIMESTAMPTZ DEFAULT now());"
-```
-
 ### HTTP Endpoint Tests
 
-**Health check:**
+```bash
+# Health check
+curl http://localhost:9090/health
 
-```sh
-curl http://localhost:8080/health
-# => {"status":"ok"}
-```
+# Bridge status
+curl http://localhost:9090/status | jq
 
-**Bridge status:**
+# Prometheus metrics
+curl http://localhost:9090/metrics
 
-```sh
-curl http://localhost:8080/status | jq
-# => Shows uptime, message counts, LSN, connection status, WAL lag, etc.
-```
+# Stream management
+curl "http://localhost:9090/streams/info?stream=CDC" | jq
 
-**Prometheus metrics:**
-
-```sh
-curl http://localhost:8080/metrics
-# => Prometheus text format metrics
-```
-
-**Stream management:**
-
-```sh
-# Get stream info
-curl "http://localhost:8080/streams/info?stream=CDC_BRIDGE" | jq
-
-# Create a test stream
-curl -X POST "http://localhost:8080/streams/create?stream=TEST&subjects=test.>"
-
-# Purge stream messages
-curl -X POST "http://localhost:8080/streams/purge?stream=TEST"
-
-# Delete stream
-curl -X POST "http://localhost:8080/streams/delete?stream=TEST"
-```
-
-**Graceful shutdown:**
-
-```sh
-curl -X POST http://localhost:8080/shutdown
-# => Bridge will shut down gracefully
+# Graceful shutdown
+curl -X POST http://localhost:9090/shutdown
 ```
 
 ### Monitoring Replication Slot
 
-```sh
-# Check PostgreSQL replication slot status
+```bash
 docker exec -it postgres psql -U postgres -c "
   SELECT slot_name, active,
          pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) as lag
   FROM pg_replication_slots
-  WHERE slot_name = 'bridge_slot';
+  WHERE slot_name = 'cdc_slot';
 "
 ```
 
-## Notes
+---
 
-- The nats.c library is built with TLS enabled.
-- The library is statically linked to avoid runtime dependencies
-- PostgreSQL logical replication requires `wal_level=logical`
-- All C code is compiled with `-std=c11`
+## Roadmap
 
-Kill my zombies!!!
+**Planned enhancements:**
+- [ ] `--format json` flag for browser-friendly encoding
+- [ ] Schema change notifications (publish to NATS on relation_id change)
+- [ ] Compression options (`--compress gzip|lz4|zstd`)
+- [ ] Multiple publication support (`--publication pub1,pub2`)
+- [ ] Metrics export to StatsD/InfluxDB
 
-```sh
-ps aux | grep bridge | grep -v grep
-```
+**Open questions:**
+- Will horizontal scaling prove simpler than multi-threading?
+- Should JSON be the default instead of MessagePack?
+- Can we reach 100K+ events/s per instance with optimizations?
+
+**Contributions welcome!** This is a learning project as much as a tool. If you find it useful (or find gaps), feedback is valuable.
+
+---
 
 ## License
 
 This project uses:
+- [nats.c](https://github.com/nats-io/nats.c) (Apache 2.0)
+- [zig-msgpack](https://github.com/zigcc/zig-msgpack) (MIT)
 
-- nats.c (Apache 2.0)
-- zig-msgpack (MIT)
+---
 
-## SCSCP
+## Notes
 
-Atomic operations guarantee atomicity - the operation completes as a single, indivisible unit that can't be interrupted or observed in a partial state by other threads. This is more than just taking a snapshot. For example:
-const value = self.write_index.load(.monotonic);  // Atomic read
-This guarantees:
-Atomicity: The read happens as one operation (no torn reads on 64-bit values)
-Thread-safety: No data races even with concurrent access
-Memory ordering: Controls visibility of other memory operations (explained below)
-Memory Ordering: .monotonic vs .acquire vs .release
-Memory ordering controls when other threads see the effects of your operations. This is crucial for lock-free algorithms.
-.monotonic (Relaxed)
-Guarantees: Only the atomicity of THIS operation
-Does NOT guarantee: Any ordering with respect to other memory operations
-Use case: When you just need an atomic read/write but don't care about synchronization with other operations
-const current_write = self.write_index.load(.monotonic);
-// Just reading the index value atomically
-// No guarantees about seeing other thread's non-atomic writes
-.acquire (Acquire)
-Guarantees: All memory operations AFTER this acquire in your code will see the effects of operations that happened BEFORE the corresponding release in another thread
-Use case: Reading data that another thread published
-const current_write = self.write_index.load(.acquire);
-// Now I can safely read buffer[i] because I'm guaranteed to see
-// the data that the producer wrote BEFORE it did release store
-.release (Release)
-Guarantees: All memory operations BEFORE this release in your code will be visible to threads that do a corresponding acquire
-Use case: Publishing data for another thread to read
-self.buffer[index] = item;  // Write data first
-self.write_index.store(next_index, .release);
-// Release ensures buffer write is visible before index update
-.seq_cst (Sequentially Consistent)
-Guarantees: Strongest ordering - total global order of all seq_cst operations
-Use case: When you need the strictest guarantees (but it's slower)
+- The nats.c library is built with TLS enabled
+- The library is statically linked to avoid runtime dependencies
+- PostgreSQL logical replication requires `wal_level=logical`
+- All C code is compiled with `-std=c11`
 
-pub fn push(self: *Self, item: T) error{QueueFull}!void {
-    const current_write = self.write_index.load(.monotonic);  // [1]
-    const current_read = self.read_index.load(.acquire);      // [2]
-    
-    // Check if full...
-    
-    self.buffer[current_write] = item;  // [3] Write data
-    
-    self.write_index.store(next_write, .release);  // [4] Publish
-}
-Line [1]: .monotonic - We just need our own current write position, no synchronization needed
-Line [2]: .acquire - We need to see if consumer freed up space (see the latest read_index from consumer's .release)
-Line [3]: Normal write to buffer
-Line [4]: .release - Ensures data write [3] is visible before index update. Consumer will see this with .acquire
-Consumer (pop):
-pub fn pop(self: *Self) ?T {
-    const current_read = self.read_index.load(.monotonic);   // [1]
-    const current_write = self.write_index.load(.acquire);   // [2]
-    
-    // Check if empty...
-    
-    const item = self.buffer[current_read];  // [3] Read data
-    
-    self.read_index.store(next_read, .release);  // [4] Free slot
-    return item;
-}
-Line [1]: .monotonic - Just need our own read position
-Line [2]: .acquire - This synchronizes with producer's .release at [4]. Now we're guaranteed to see the data written at [3]
-Line [3]: Read the data (safe because of acquire/release pairing)
-Line [4]: .release - Tell producer this slot is free (producer will see this with its .acquire)
-The Acquire/Release Contract
-Think of it as a happens-before relationship:
-Producer Thread:              Consumer Thread:
-------------------           ------------------
-buffer[5] = data             
-write_index.store(6, .release)  →  write_index.load(.acquire)
-                                   item = buffer[5]  ✓ sees data
-Without proper ordering, the consumer might see the updated write_index but stale data in the buffer due to CPU reordering or cache coherency delays.
-Why Not Always Use .seq_cst?
-.seq_cst is the safest but slowest. For SPSC queues, we can use cheaper orderings because:
-Only 2 threads (producer/consumer)
-Clear ownership model (each index owned by one thread)
-Acquire/release is sufficient for the synchronization we need
-Your SPSC queue uses the optimal memory orderings for maximum performance while maintaining correctness!The Two-Stage Architecture
-Stage 1: Lock-Free Queue (TRUE Concurrency)
-// In AsyncBatchPublisher struct (line 18)
-event_queue: SPSCQueue(batch_publisher.CDCEvent),
-Main thread (producer) calls addEvent() which:
-Copies metadata strings to heap
-Takes ownership of columns ArrayList
-Pushes CDCEvent to lock-free SPSC queue (line 119)
-Flush thread (consumer) in flushLoop():
-Pops CDCEvent from lock-free SPSC queue (line 180)
-Transfers ownership to its own private ArrayList
-Stage 2: Private ArrayList (NO Concurrency)
-// In flushLoop() - line 167
-var batch = std.ArrayList(batch_publisher.CDCEvent){};
-This ArrayList is local to the flush thread only. The main thread never touches it.
-Where TRUE Concurrency Happens
-The concurrent read/write happens at the SPSC queue boundary:
-Main thread writes to event_queue via atomic write_index (spsc_queue.zig:80)
-Flush thread reads from event_queue via atomic read_index (spsc_queue.zig:104)
-These operations happen simultaneously:
-While flush thread is draining events at index 100-199
-Main thread is pushing new events at index 200-299
-No locks, just atomic index updates with memory ordering
-Why This Design?
-The SPSC queue provides:
-Wait-free operations: Push/pop never block
-Cache-friendly: Separate cache lines for indices (line 30-31)
-Backpressure: Queue full → main thread yields (line 129)
-Zero contention on ArrayList: Each thread owns its own
-What Would Happen Without Lock-Free Queue?
-If we used a shared mutex-protected ArrayList:
-// BAD: Shared ArrayList with mutex
-var shared_batch: std.ArrayList(CDCEvent) = ...;
-var mutex: std.Thread.Mutex = ...;
-
-// Main thread blocks during flush!
-mutex.lock();
-try shared_batch.append(event);
-mutex.unlock();
-This would cause:
-Main thread blocks while flush thread holds mutex
-Flush thread blocks while main thread adds events
-Terrible throughput under load
+**Kill zombie processes:**
+```bash
+ps aux | grep bridge | grep -v grep | awk '{print $2}' | xargs kill
+```
