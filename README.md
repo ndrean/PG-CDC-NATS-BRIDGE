@@ -2,7 +2,7 @@
 
 ![Zig support](https://img.shields.io/badge/Zig-0.15.2-color?logo=zig&color=%23f3ab20)
 
-A lightweight (15MB), opinionated bridge for streaming PostgreSQL changes to NATS JetStream. Built with Zig for minimal overhead, includes table bootstrapping for consumer initialization.
+A lightweight (15MB), opinionated bridge for streaming PostgreSQL _proto-v1_ changes to NATS JetStream. Built with Zig for minimal overhead, includes table bootstrapping for consumer initialization.
 
 ⚠️ **Status**: Early stage, not yet battle-tested in production. Suitable for experimentation and non-critical workloads.
 
@@ -48,6 +48,14 @@ This bridge is an **experiment in minimalism**: can PostgreSQL CDC be done with 
 The design makes deliberate trade-offs for simplicity and efficiency.
 
 ### What It Does
+
+**Uses Protocol v1**:
+
+The plugin `pgoutput` will send data after the transaction is commited.
+
+The upwards versions 2,3,4 are not implemented.
+Version 2 introduced _streaming transactions_.
+Version 3 introduced row filtering (eg only replicate rows where user_id > 1000) and column filtering.
 
 **Two-phase data flow:**
 
