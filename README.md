@@ -1010,7 +1010,8 @@ Consider: `read_index == write_index` means _empty_.
 | A   | B   | C   | D   | E   | F   | G   |     |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 
-Fill the 8th slot: write_index=0 (wraps), read_index=0 ❌
+Fill the 8th slot: write_index=0 (wraps), read_index=0
+
 | A   | B   | C   | D   | E   | F   | G   | H   |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 
@@ -1057,17 +1058,17 @@ Examples:
 CPU caches work in cache lines (64 bytes on x86-64). **Without alignment**, both indices share a cache line:
 
 ```txt
-Cache Line 0: [write_index][read_index][other data...] ❌ 
+Cache Line 0: [write_index][read_index][other data...] <-- BAD! 
 ```
 
 Problem: Producer updates `write_index` → invalidates consumer's cache → ping-pong between CPU cores!
 
-**With alignment**, each index owns its cache line:
+**With alignment**, each index owns its cache line: ✅
 
 ```txt
 Cache Line 0: [write_index][padding...............]  ← Producer owns
 Cache Line 1: [read_index][padding................]  ← Consumer owns
-✅ 
+
 ```
 
 This is achieved with:
@@ -1542,6 +1543,7 @@ docker exec -it postgres psql -U postgres -c "
 
 - [ ] Compression options (`--compress zstd`)
 - [ ] Metrics export to StatsD/InfluxDB
+- [ ] Integrate MySQL connector option?
 
 **Open questions:**:
 
