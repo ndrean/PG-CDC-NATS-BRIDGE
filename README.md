@@ -197,22 +197,24 @@ wal_sender_timeout = 300s  # 5 minutes
 
 #### 2. Create Publication
 
-On specific tables:
+The BDA create a publication say `my_pub` on specific tables 'users', 'orders':
 
 ```sql
-CREATE PUBLICATION cdc_pub FOR TABLE users, orders;
+CREATE PUBLICATION my_pub FOR TABLE users, orders;
 ```
 
 Or for all tables:
 
 ```sql
 -- Run as superuser
-CREATE PUBLICATION cdc_pub FOR ALL TABLES;
+CREATE PUBLICATION my_pub FOR ALL TABLES;
 ```
 
 #### 3. Create Bridge User
 
 > [!NOTE] The bridge uses a restricted `bridge_reader` user for security. It should be restricted to SELECT on given tables + REPLICATION (least privilege).
+
+The DBA creates:
 
 ```sql
 -- Run as superuser
@@ -278,7 +280,7 @@ nats kv add schemas --history=10 --replicas=1
 
 #### 4. Configure Authentication
 
-Example `nats-server.conf`:
+Example `nats-server.conf` where we use `user | password`:
 
 ```yml
 port: 4222
