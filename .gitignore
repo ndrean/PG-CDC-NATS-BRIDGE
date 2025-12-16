@@ -6,6 +6,7 @@ zig-cache/
 
 # NATS data
 nats-data/
+.claude/
 
 # Dependencies (vendored)
 libs/

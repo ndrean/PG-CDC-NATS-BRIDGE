@@ -19,7 +19,7 @@ flowchart LR
         KV[KV Store: <br>schemas<br>key=table]
     end
 
-    NATS --> Consumer[Consumer<br>option ZSTD decompress<br> MessagePack or JSON decoding<br>SQLite/PGLite]
+    NATS --> Consumer[Consumer<br>option ZSTD decompress<br> MessagePack or JSON<br>SQLite/PGLite]
 ```
 
 ## Table of Contents

@@ -355,24 +355,32 @@ fn generateIncrementalSnapshot(
 
     const lsn_str = std.mem.span(c.PQgetvalue(lsn_result, 0, 0));
 
+    // Create arena allocator for snapshot processing (reused across all chunks)
+    // This significantly reduces allocation overhead for CSV parsing and MessagePack encoding
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
     // Use COPY CSV format to fetch rows in chunks
     var batch: u32 = 0;
     var total_rows: u64 = 0;
     var offset_rows: u64 = 0;
 
     while (true) {
+        // Reset arena for this chunk (retains capacity for efficiency)
+        defer _ = arena.reset(.retain_capacity);
+        const chunk_alloc = arena.allocator();
+
         // Build COPY CSV query with LIMIT/OFFSET for chunking
         const copy_query = try std.fmt.allocPrintSentinel(
-            allocator,
+            chunk_alloc,
             "COPY (SELECT * FROM {s} ORDER BY id LIMIT {d} OFFSET {d}) TO STDOUT WITH (FORMAT csv, HEADER true)",
             .{ table_name, chunk_size, offset_rows },
             0,
         );
-        defer allocator.free(copy_query);
 
-        // Parse CSV COPY data
+        // Parse CSV COPY data using arena allocator
         var parser = pg_copy_csv.CopyCsvParser.init(
-            allocator,
+            chunk_alloc,
             @ptrCast(conn),
         );
         defer parser.deinit();
@@ -382,18 +390,18 @@ fn generateIncrementalSnapshot(
             return error.CopyFailed;
         };
 
-        // Collect rows into array
+        // Collect rows into array using arena allocator
         var rows_list: std.ArrayList(pg_copy_csv.CsvRow) = .{};
         defer {
             for (rows_list.items) |*row| {
                 row.deinit();
             }
-            rows_list.deinit(allocator);
+            rows_list.deinit(chunk_alloc);
         }
 
         var row_iterator = parser.rows();
         while (try row_iterator.next()) |row| {
-            try rows_list.append(allocator, row);
+            try rows_list.append(chunk_alloc, row);
         }
 
         const num_rows = rows_list.items.len;
@@ -404,9 +412,9 @@ fn generateIncrementalSnapshot(
         // Get column names from parser header
         const col_names = parser.columnNames() orelse return error.NoHeader;
 
-        // Encode chunk as MessagePack with metadata wrapper
+        // Encode chunk as MessagePack with metadata wrapper using arena allocator
         const encoded = try encodeCsvRowsToMessagePack(
-            allocator,
+            chunk_alloc,
             rows_list.items,
             col_names,
             table_name,
@@ -415,7 +423,6 @@ fn generateIncrementalSnapshot(
             batch,
             format,
         );
-        defer allocator.free(encoded);
 
         // Compress if enabled
         const payload = if (enable_compression) blk: {
