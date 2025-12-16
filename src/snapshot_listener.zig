@@ -344,7 +344,18 @@ fn generateIncrementalSnapshot(
         return error.ConnectionFailed;
     }
 
-    // Get current LSN for snapshot consistency
+    // Begin transaction with REPEATABLE READ isolation for snapshot consistency
+    // This ensures all COPY queries see the same database state
+    const begin_result = c.PQexec(conn, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    defer c.PQclear(begin_result);
+
+    if (c.PQresultStatus(begin_result) != c.PGRES_COMMAND_OK) {
+        log.err("BEGIN REPEATABLE READ failed: {s}", .{c.PQerrorMessage(conn)});
+        return error.TransactionFailed;
+    }
+
+    // Get snapshot LSN AFTER beginning transaction
+    // This LSN represents the consistent point in WAL for this snapshot
     const lsn_query = "SELECT pg_current_wal_lsn()::text";
     const lsn_result = c.PQexec(conn, lsn_query.ptr);
     defer c.PQclear(lsn_result);
@@ -355,26 +366,30 @@ fn generateIncrementalSnapshot(
 
     const lsn_str = std.mem.span(c.PQgetvalue(lsn_result, 0, 0));
 
+    log.info("📸 Snapshot transaction started at LSN: {s}", .{lsn_str});
+
     // Create arena allocator for snapshot processing (reused across all chunks)
     // This significantly reduces allocation overhead for CSV parsing and MessagePack encoding
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
     // Use COPY CSV format to fetch rows in chunks
+    // Use WHERE id > last_id instead of OFFSET for better performance on large tables
     var batch: u32 = 0;
     var total_rows: u64 = 0;
-    var offset_rows: u64 = 0;
+    var last_id: i64 = 0; // Track last ID instead of offset
 
     while (true) {
         // Reset arena for this chunk (retains capacity for efficiency)
         defer _ = arena.reset(.retain_capacity);
         const chunk_alloc = arena.allocator();
 
-        // Build COPY CSV query with LIMIT/OFFSET for chunking
+        // Build COPY CSV query with WHERE id > last_id for efficient chunking
+        // This is much faster than OFFSET for large tables
         const copy_query = try std.fmt.allocPrintSentinel(
             chunk_alloc,
-            "COPY (SELECT * FROM {s} ORDER BY id LIMIT {d} OFFSET {d}) TO STDOUT WITH (FORMAT csv, HEADER true)",
-            .{ table_name, chunk_size, offset_rows },
+            "COPY (SELECT * FROM {s} WHERE id > {d} ORDER BY id LIMIT {d}) TO STDOUT WITH (FORMAT csv, HEADER true)",
+            .{ table_name, last_id, chunk_size },
             0,
         );
 
@@ -471,13 +486,34 @@ fn generateIncrementalSnapshot(
         });
 
         batch += 1;
-        offset_rows += num_rows;
+
+        // Update last_id from the last row's id field (first column)
+        // This assumes 'id' is the first column in ORDER BY id
+        if (num_rows > 0) {
+            const last_row = rows_list.items[num_rows - 1];
+            if (last_row.fields.len > 0) {
+                if (last_row.fields[0].value) |id_str| {
+                    last_id = std.fmt.parseInt(i64, id_str, 10) catch last_id;
+                }
+            }
+        }
 
         // If we got fewer rows than chunk_size, we're done
         if (num_rows < chunk_size) {
             break;
         }
     }
+
+    // Commit transaction to release snapshot isolation
+    const commit_result = c.PQexec(conn, "COMMIT");
+    defer c.PQclear(commit_result);
+
+    if (c.PQresultStatus(commit_result) != c.PGRES_COMMAND_OK) {
+        log.err("COMMIT failed: {s}", .{c.PQerrorMessage(conn)});
+        return error.TransactionFailed;
+    }
+
+    log.info("✅ Snapshot transaction committed", .{});
 
     // Publish metadata: init.users.meta
     try publishSnapshotMetadata(
@@ -572,6 +608,23 @@ fn encodeChunkToMessagePack(result: ?*c.PGresult, allocator: std.mem.Allocator) 
     return try buffer.toOwnedSlice(allocator);
 }
 
+/// Parse PostgreSQL LSN format (e.g., "0/17FBE78") to u64
+/// PostgreSQL LSN format: "segment/offset" where both are hex numbers
+fn parsePgLsn(lsn_str: []const u8) !u64 {
+    // Find the '/' separator
+    const slash_pos = std.mem.indexOfScalar(u8, lsn_str, '/') orelse return error.InvalidLsnFormat;
+
+    const segment_str = lsn_str[0..slash_pos];
+    const offset_str = lsn_str[slash_pos + 1..];
+
+    // Parse both parts as hex
+    const segment = try std.fmt.parseInt(u32, segment_str, 16);
+    const offset = try std.fmt.parseInt(u32, offset_str, 16);
+
+    // Combine: segment is upper 32 bits, offset is lower 32 bits
+    return (@as(u64, segment) << 32) | @as(u64, offset);
+}
+
 /// Encode CSV rows to MessagePack with metadata wrapper
 /// Wraps snapshot data with table name, operation type, LSN, and chunk info
 fn encodeCsvRowsToMessagePack(
@@ -617,11 +670,14 @@ fn encodeCsvRowsToMessagePack(
     var wrapper_map = encoder.createMap();
     defer wrapper_map.free(allocator);
 
+    // Parse PostgreSQL LSN string to u64 integer (same format as CDC events)
+    const lsn_int = try parsePgLsn(lsn);
+
     try wrapper_map.put("table", try encoder.createString(table_name));
     try wrapper_map.put("operation", try encoder.createString("snapshot"));
     try wrapper_map.put("snapshot_id", try encoder.createString(snapshot_id));
     try wrapper_map.put("chunk", encoder.createInt(@intCast(chunk)));
-    try wrapper_map.put("lsn", try encoder.createString(lsn));
+    try wrapper_map.put("lsn", encoder.createInt(@intCast(lsn_int)));
     try wrapper_map.put("data", data_array);
 
     return try encoder.encode(wrapper_map);
@@ -648,8 +704,11 @@ fn publishSnapshotMetadata(
     var meta_map = encoder.createMap();
     defer meta_map.free(allocator);
 
+    // Parse PostgreSQL LSN string to u64 integer (same format as CDC events)
+    const lsn_int = try parsePgLsn(lsn);
+
     try meta_map.put("snapshot_id", try encoder.createString(snapshot_id));
-    try meta_map.put("lsn", try encoder.createString(lsn));
+    try meta_map.put("lsn", encoder.createInt(@intCast(lsn_int)));
     try meta_map.put("timestamp", encoder.createInt(std.time.timestamp()));
     try meta_map.put("batch_count", encoder.createInt(@intCast(batch_count)));
     try meta_map.put("row_count", encoder.createInt(@intCast(row_count)));

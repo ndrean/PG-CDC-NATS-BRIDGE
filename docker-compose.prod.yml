@@ -65,7 +65,7 @@ services:
       - "--port"
       - "${BRIDGE_PORT}"
       - "--msgpack"
-      - "--zstd"
+      # - "--zstd"
 
     networks:
       - cdc-bridge

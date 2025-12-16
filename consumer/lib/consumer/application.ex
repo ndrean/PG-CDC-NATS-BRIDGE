@@ -43,7 +43,7 @@ defmodule Consumer.Application do
   defp consumer_cdc_settings do
     %Gnat.Jetstream.API.Consumer{
       # consumer position tracking is persisted
-      durable_name: "ex_cdc_consumer",
+      durable_name: "ex_cdc_consumer_1",
       stream_name: "CDC",
       ack_policy: :explicit,
       # 60 seconds in nanoseconds
@@ -58,7 +58,7 @@ defmodule Consumer.Application do
   defp consumer_init_settings do
     %Gnat.Jetstream.API.Consumer{
       # consumer position tracking is persisted
-      durable_name: "ex_init_consumer",
+      durable_name: "ex_init_consumer_1",
       stream_name: "INIT",
       ack_policy: :explicit,
       # 60 seconds in nanoseconds

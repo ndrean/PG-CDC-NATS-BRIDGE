@@ -30,7 +30,7 @@ defmodule Consumer.Cdc do
 
   @impl true
   def handle_message(%{topic: topic, body: body} = _message, state) do
-    dbg(topic)
+    # dbg(topic)
 
     try do
       case :persistent_term.get(:format, "msgpack") do
@@ -40,14 +40,18 @@ defmodule Consumer.Cdc do
           if is_list(decoded) do
             Enum.each(decoded, fn event ->
               data_str = if event["data"], do: " data=#{inspect(event["data"])}", else: ""
+              lsn_str = if event["lsn"], do: " lsn=#{event["lsn"]}", else: ""
 
               Logger.info(
-                "[CDC Consumer] Batch event - table: #{event["table"]}, operation: #{event["operation"]}, msg_id: #{event["msg_id"]}#{data_str}"
+                "[CDC Consumer] Batch event - table: #{event["table"]}, operation: #{event["operation"]}, msg_id: #{event["msg_id"]}#{lsn_str}#{data_str}"
               )
             end)
           else
+            data_str = if decoded["data"], do: " data=#{inspect(decoded["data"])}", else: ""
+            lsn_str = if decoded["lsn"], do: " lsn=#{decoded["lsn"]}", else: ""
+
             Logger.info(
-              "[CDC Consumer] #{topic}: table=#{decoded["table"]}, operation=#{decoded["operation"]}#{inspect(decoded["data"])}"
+              "[CDC Consumer] #{topic}: table=#{decoded["table"]}, operation=#{decoded["operation"]}#{lsn_str}#{data_str}"
             )
           end
 
@@ -55,20 +59,22 @@ defmodule Consumer.Cdc do
           decoded = Msgpax.unpack!(body)
 
           if is_list(decoded) do
-            # Batch of events - each event has table, operation, subject, msg_id, and data
+            # Batch of events - each event has table, operation, subject, msg_id, lsn, and data
             Enum.each(decoded, fn event ->
               data_str = if event["data"], do: " data=#{inspect(event["data"])}", else: ""
+              lsn_str = if event["lsn"], do: " lsn=#{event["lsn"]}", else: ""
 
               Logger.info(
-                "[CDC Consumer] Batch event - table: #{event["table"]}, operation: #{event["operation"]}, msg_id: #{event["msg_id"]}#{data_str}"
+                "[CDC Consumer] Batch event - table: #{event["table"]}, operation: #{event["operation"]}, msg_id: #{event["msg_id"]}#{lsn_str}#{data_str}"
               )
             end)
           else
-            # Single event with table, operation, and data fields
+            # Single event with table, operation, lsn, and data fields
             data_str = if decoded["data"], do: " data=#{inspect(decoded["data"])}", else: ""
+            lsn_str = if decoded["lsn"], do: " lsn=#{decoded["lsn"]}", else: ""
 
             Logger.info(
-              "[CDC Consumer] #{topic}: table=#{decoded["table"]}, operation=#{decoded["operation"]}#{data_str}"
+              "[CDC Consumer] #{topic}: table=#{decoded["table"]}, operation=#{decoded["operation"]}#{lsn_str}#{data_str}"
             )
           end
       end

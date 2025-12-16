@@ -268,6 +268,7 @@ pub const BatchPublisher = struct {
             try event_map.put("operation", try encoder.createString(event.operation));
             try event_map.put("msg_id", try encoder.createString(event.msg_id));
             try event_map.put("relation_id", encoder.createInt(@intCast(event.relation_id)));
+            try event_map.put("lsn", encoder.createInt(@intCast(event.lsn)));
 
             // Add column data if present
             if (event.data) |columns| {
@@ -311,6 +312,7 @@ pub const BatchPublisher = struct {
                 try event_map.put("operation", try encoder.createString(event.operation));
                 try event_map.put("msg_id", try encoder.createString(event.msg_id));
                 try event_map.put("relation_id", encoder.createInt(@intCast(event.relation_id)));
+                try event_map.put("lsn", encoder.createInt(@intCast(event.lsn)));
 
                 // Add column data if present
                 if (event.data) |columns| {

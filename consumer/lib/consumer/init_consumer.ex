@@ -50,29 +50,30 @@ defmodule Consumer.Init do
     try do
       Task.Supervisor.start_child(MyTaskSupervisor, fn ->
         byte_size(message.body) |> dbg()
-        # decoded =
-        #   case format do
-        #     "json" ->
-        #       _decoded = Jason.decode!(message.body)
 
-        #     "msgpack" ->
-        #       _decoded = Msgpax.unpack!(message.body)
-        #   end
+        decoded =
+          case format do
+            "json" ->
+              _decoded = Jason.decode!(message.body)
 
-        # # TODO: insert into DB based on schema in state
-        # data = decoded["data"]
+            "msgpack" ->
+              _decoded = Msgpax.unpack!(message.body)
+          end
 
-        # len =
-        #   case is_list(data) do
-        #     true -> length(data)
-        #     _ -> 0
-        #   end
+        # TODO: insert into DB based on schema in state
+        data = decoded["data"]
 
-        # Logger.info(
-        #   "[INIT Consumer] #{System.system_time(:microsecond)} Processed snapshot chunk with #{len} records"
-        # )
+        len =
+          case is_list(data) do
+            true -> length(data)
+            _ -> 0
+          end
 
-        # Logger.info("[INIT Consumer] Processed snapshot chunk message:  #{inspect(decoded)}")
+        Logger.info(
+          "[INIT Consumer] #{System.system_time(:microsecond)} Processed snapshot chunk with #{len} records"
+        )
+
+        Logger.info("[INIT Consumer] Processed snapshot chunk message:  #{inspect(decoded)}")
       end)
 
       System.system_time(:microsecond) |> dbg()
