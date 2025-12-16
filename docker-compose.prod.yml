@@ -64,7 +64,8 @@ services:
       - "${BRIDGE_CDC_PUBLICATION}"
       - "--port"
       - "${BRIDGE_PORT}"
-      - "--json"
+      - "--msgpack"
+      - "--zstd"
 
     networks:
       - cdc-bridge

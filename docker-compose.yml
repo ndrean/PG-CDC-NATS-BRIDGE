@@ -95,12 +95,15 @@ services:
           sleep 2
         done
         echo 'NATS server is ready!'
+
         echo 'Creating NATS JetStream stream: CDC'
-        nats stream add CDC --server=nats://${NATS_BRIDGE_USER}:${NATS_BRIDGE_PASSWORD}@nats-server:4222 --subjects='cdc.>' --storage=file --retention=limits --max-age=1m --max-msgs=1000000 --max-bytes=1G --replicas=1 --defaults || true
+        nats stream add CDC --server=nats://${NATS_BRIDGE_USER}:${NATS_BRIDGE_PASSWORD}@nats-server:4222 --subjects='cdc.>' --storage=file --retention=limits --max-age=1m --max-msgs=1000000 --max-bytes=1G --replicas=1 --compression s2 --defaults || true
         echo 'Stream CDC created successfully'
+
         echo 'Creating NATS JetStream stream: INIT'
-        nats stream add INIT --server=nats://${NATS_BRIDGE_USER}:${NATS_BRIDGE_PASSWORD}@nats-server:4222 --subjects='init.>' --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --defaults || true
+        nats stream add INIT --server=nats://${NATS_BRIDGE_USER}:${NATS_BRIDGE_PASSWORD}@nats-server:4222 --subjects='init.>' --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
         echo 'Stream INIT created successfully'
+
         echo 'Creating NATS KV bucket: schemas'
         nats kv add schemas --server=nats://${NATS_BRIDGE_USER}:${NATS_BRIDGE_PASSWORD}@nats-server:4222 --history=10 --replicas=1 || true
         echo 'KV bucket schemas created successfully'

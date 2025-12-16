@@ -11,6 +11,7 @@ jetstream {
     # Max memory and storage
     max_memory_store: 1GB
     max_file_store: 10GB
+    
 }
 
 # Logging

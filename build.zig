@@ -128,6 +128,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Create local zstd module (links system libzstd)
+    const zstd_mod = b.addModule("zstd", .{
+        .root_source_file = b.path("src/zstd.zig"),
+        .target = target,
+    });
+
     const exe = b.addExecutable(.{
         .name = "bridge",
         .root_module = b.createModule(.{
@@ -139,6 +145,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "bridge", .module = mod },
                 .{ .name = "msgpack", .module = msgpack.module("msgpack") },
+                .{ .name = "zstd", .module = zstd_mod },
             },
         }),
     });
@@ -155,6 +162,9 @@ pub fn build(b: *std.Build) void {
     // Link OpenSSL (required for NATS TLS support)
     exe.linkSystemLibrary("ssl");
     exe.linkSystemLibrary("crypto");
+
+    // Link system libzstd (for compression)
+    exe.linkSystemLibrary("zstd");
 
     // Link vendored libpq
     linkLibpq(exe, b);

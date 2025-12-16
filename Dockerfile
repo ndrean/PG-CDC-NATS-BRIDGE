@@ -14,7 +14,9 @@ RUN apk add --no-cache \
     g++ \
     musl-dev \
     postgresql-dev \
-    openssl-dev
+    openssl-dev \
+    zstd-dev \
+    zstd-static
 
 # Download and install Zig 0.15.2 (matching local development version)
 # Detect architecture and download appropriate version
@@ -42,11 +44,12 @@ RUN zig build -Doptimize=ReleaseFast
 
 FROM ${BASE_IMAGE}
 
-# Install only runtime PostgreSQL library
+# Install runtime libraries
 RUN apk add --no-cache \
     libpq \
     ca-certificates \
-    openssl-dev 
+    openssl-dev \
+    zstd-libs 
 
 COPY --from=builder /build/zig-out/bin/bridge /usr/local/bin/bridge
 

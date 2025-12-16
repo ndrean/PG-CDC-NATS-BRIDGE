@@ -15,6 +15,8 @@ const config = @import("config.zig");
 const msgpack = @import("msgpack");
 const pg_copy_csv = @import("pg_copy_csv.zig");
 const encoder_mod = @import("encoder.zig");
+const zstd = @import("zstd");
+const RuntimeConfig = @import("config.zig").RuntimeConfig;
 
 pub const log = std.log.scoped(.snapshot_listener);
 
@@ -26,6 +28,8 @@ const SnapshotContext = struct {
     monitored_tables: []const []const u8,
     format: encoder_mod.Format,
     chunk_size: usize,
+    enable_compression: bool,
+    recipe: config.CompressionRecipe,
 };
 
 /// Snapshot listener with thread management
@@ -38,6 +42,8 @@ pub const SnapshotListener = struct {
     thread: ?std.Thread = null,
     format: encoder_mod.Format,
     chunk_size: usize,
+    enable_compression: bool,
+    recipe: config.CompressionRecipe,
 
     /// Initialize snapshot listener (does not start the thread)
     pub fn init(
@@ -58,6 +64,8 @@ pub const SnapshotListener = struct {
             .thread = null,
             .format = format,
             .chunk_size = runtime_config.snapshot_chunk_size,
+            .enable_compression = runtime_config.enable_compression,
+            .recipe = runtime_config.recipe,
         };
     }
 
@@ -93,6 +101,8 @@ pub const SnapshotListener = struct {
             self.monitored_tables,
             self.format,
             self.chunk_size,
+            self.enable_compression,
+            self.recipe,
         );
     }
 };
@@ -216,6 +226,8 @@ fn onSnapshotRequest(
         snapshot_id,
         ctx.format,
         ctx.chunk_size,
+        ctx.enable_compression,
+        ctx.recipe,
     ) catch |err| {
         log.err("Snapshot generation failed for table '{s}': {}", .{ table_name, err });
         return;
@@ -233,6 +245,8 @@ pub fn listenForSnapshotRequests(
     monitored_tables: []const []const u8,
     format: encoder_mod.Format,
     chunk_size: usize,
+    enable_compression: bool,
+    recipe: config.CompressionRecipe,
 ) !void {
     log.info("🔔 Starting NATS snapshot listener thread", .{});
 
@@ -244,6 +258,8 @@ pub fn listenForSnapshotRequests(
         .monitored_tables = monitored_tables,
         .format = format,
         .chunk_size = chunk_size,
+        .enable_compression = enable_compression,
+        .recipe = recipe,
     };
 
     // Subscribe to snapshot.request.> (wildcard for all tables)
@@ -308,6 +324,8 @@ fn generateIncrementalSnapshot(
     snapshot_id: []const u8,
     format: encoder_mod.Format,
     chunk_size: usize,
+    enable_compression: bool,
+    recipe: config.CompressionRecipe,
 ) !void {
     log.info("🔄 Generating incremental snapshot for table '{s}' (snapshot_id={s})", .{
         table_name,
@@ -399,6 +417,24 @@ fn generateIncrementalSnapshot(
         );
         defer allocator.free(encoded);
 
+        // Compress if enabled
+        const payload = if (enable_compression) blk: {
+            // Convert config.CompressionRecipe to zstd.CompressionRecipe
+            const zstd_recipe: zstd.CompressionRecipe = @enumFromInt(@intFromEnum(recipe));
+            const cctx = try zstd.init_compressor(.{ .recipe = zstd_recipe });
+            defer _ = zstd.free_compressor(cctx);
+
+            const compressed = try zstd.compress(allocator, cctx, encoded);
+            log.info("🗜️  Compressed chunk {d}: {d} → {d} bytes ({d:.1}% reduction)", .{
+                batch,
+                encoded.len,
+                compressed.len,
+                @as(f64, @floatFromInt(encoded.len - compressed.len)) / @as(f64, @floatFromInt(encoded.len)) * 100.0,
+            });
+            break :blk compressed;
+        } else encoded;
+        defer if (enable_compression) allocator.free(payload);
+
         // Publish chunk to NATS: init.snap.users.snap-1733507200.0
         const subject = try std.fmt.allocPrintSentinel(
             allocator,
@@ -416,13 +452,14 @@ fn generateIncrementalSnapshot(
         );
         defer allocator.free(msg_id_buf);
 
-        try publisher.publish(subject, encoded, msg_id_buf);
+        try publisher.publish(subject, payload, msg_id_buf);
         try publisher.flushAsync();
 
-        log.info("📦 Published snapshot chunk {d} ({d} rows, {d} bytes CSV) → {s}", .{
+        log.info("📦 Published snapshot chunk {d} ({d} rows, {d} bytes {s}) → {s}", .{
             batch,
             num_rows,
-            encoded.len,
+            payload.len,
+            if (enable_compression) "compressed" else "uncompressed",
             subject,
         });
 

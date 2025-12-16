@@ -5,6 +5,18 @@
 
 const std = @import("std");
 
+/// Compression recipe for zstd snapshots
+/// Defined here to avoid circular imports (config.zig ← → zstd.zig)
+/// The actual compression parameters (level, strategy) are interpreted by zstd.zig
+pub const CompressionRecipe = enum {
+    fast,            // level 1, fast strategy
+    balanced,        // level 3, dfast strategy
+    binary,          // level 6, lazy2 strategy (default for snapshots)
+    text,            // level 9, btopt strategy
+    structured_data, // level 9, btultra strategy (MessagePack/JSON)
+    maximum,         // level 22, btultra2 strategy
+};
+
 /// PostgreSQL connection and replication configuration
 pub const Postgres = struct {
     pub const default_slot_name = "cdc_slot";
@@ -242,6 +254,10 @@ pub const RuntimeConfig = struct {
     // Snapshot settings
     snapshot_chunk_size: usize,
 
+    // Compression settings
+    enable_compression: bool,
+    recipe: CompressionRecipe,
+
     /// Create default runtime configuration from compile-time constants
     /// Note: PostgreSQL connection fields are set to defaults that should be overridden from environment
     pub fn defaults() RuntimeConfig {
@@ -260,6 +276,8 @@ pub const RuntimeConfig = struct {
             .batch_max_payload_bytes = Batch.max_payload_bytes,
             .batch_ring_buffer_size = Batch.ring_buffer_size,
             .snapshot_chunk_size = Snapshot.chunk_size,
+            .enable_compression = false, // disabled by default
+            .recipe = .binary, // optimal balance for snapshots (94% compression, 6ms/MB)
         };
     }
 

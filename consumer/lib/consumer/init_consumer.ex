@@ -49,18 +49,33 @@ defmodule Consumer.Init do
 
     try do
       Task.Supervisor.start_child(MyTaskSupervisor, fn ->
-        decoded =
-          case format do
-            "json" ->
-              _decoded = Jason.decode!(message.body) |> dbg()
+        byte_size(message.body) |> dbg()
+        # decoded =
+        #   case format do
+        #     "json" ->
+        #       _decoded = Jason.decode!(message.body)
 
-            "msgpack" ->
-              _decoded = Msgpax.unpack!(message.body) |> dbg()
-          end
+        #     "msgpack" ->
+        #       _decoded = Msgpax.unpack!(message.body)
+        #   end
 
-        # TODO: insert into DB based on schema in state
-        Logger.info("[INIT Consumer] Processed snapshot chunk message: #{inspect(decoded)}")
+        # # TODO: insert into DB based on schema in state
+        # data = decoded["data"]
+
+        # len =
+        #   case is_list(data) do
+        #     true -> length(data)
+        #     _ -> 0
+        #   end
+
+        # Logger.info(
+        #   "[INIT Consumer] #{System.system_time(:microsecond)} Processed snapshot chunk with #{len} records"
+        # )
+
+        # Logger.info("[INIT Consumer] Processed snapshot chunk message:  #{inspect(decoded)}")
       end)
+
+      System.system_time(:microsecond) |> dbg()
 
       {:ack, state}
     rescue
@@ -200,6 +215,8 @@ defmodule Consumer.Init do
         nil -> ["users", "test_types"]
         tables_str -> String.split(tables_str, ",") |> Enum.map(&String.trim/1)
       end
+
+    System.system_time(:microsecond) |> dbg()
 
     # Request snapshot for each table
     Enum.each(tables, fn table_name ->

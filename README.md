@@ -2,7 +2,9 @@
 
 ![Zig support](https://img.shields.io/badge/Zig-0.15.2-color?logo=zig&color=%23f3ab20)
 
-A lightweight (15MB), opinionated bridge for streaming PostgreSQL _proto-v1_ changes to NATS JetStream. Built with Zig for minimal overhead, includes table bootstrapping for consumer initialization.
+A lightweight (15MB), opinionated bridge for streaming PostgreSQL _proto-v1_ changes to NATS JetStream with default MessagePack encoding (and JSON option).
+
+Built with Zig for minimal overhead, includes table bootstrapping for consumer initialization with optional ZSTD compression
 
 ⚠️ **Status**: Early stage, not yet battle-tested in production. Suitable for experimentation and non-critical workloads.
 
@@ -17,7 +19,7 @@ flowchart LR
         KV[KV Store: <br>schemas<br>key=table]
     end
 
-    NATS --> Consumer[Consumer<br>Local <br>SQLite/PGLite]
+    NATS --> Consumer[Consumer<br>option ZSTD decompress<br> MessagePack or JSON decoding<br>SQLite/PGLite]
 ```
 
 ## Table of Contents
@@ -62,16 +64,17 @@ Version 3 introduced row filtering (eg only replicate rows where user_id > 1000)
 
 **Two-phase data flow:**
 
-1. **Bootstrap** (INIT stream): Consumer requests table snapshot → receives data in chunks
-2. **Real-time CDC** (CDC stream): Consumer receives INSERT/UPDATE/DELETE events as they happen
+1. **Bootstrap** (INIT stream): Consumer requests table snapshot → receives data in  optionaly `ZSTD` compressed and `MessagePack` or `JSON` encoded
+2. **Real-time CDC** (CDC stream): Consumer receives INSERT/UPDATE/DELETE events as they happen MessagePack or JSON encoded
 
 **Key features:**
 
 - Streams PostgreSQL changes using logical replication (pgoutput format)
 - Publishes schemas to NATS KV store on startup
-- Generates table snapshots on-demand (10K row chunks) via NATS requests.
+- Generates table snapshots on-demand (10K row chunks) via NATS requests
+- **Optional zstd compression** for snapshots (90-95% compression with per-table dictionaries)
 - Triggers message to NATS on schema change
-- MessagePack encoding by default for efficiency (JSON available with `--json`)
+- MessagePack default encoding or JSON available with `--json`
 - At-least-once delivery with idempotent message IDs
 - Graceful shutdown with LSN acknowledgment
 - 16MB Docker image, 7MB RAM usage
@@ -88,16 +91,34 @@ Consumers wanting to mirror PostgreSQL tables locally (SQLite, PGLite, etc.) and
 
 ## Design Philosophy
 
+
 ### 1. Encoding
 
 **Default: MessagePack**
 - Compact (~30% smaller than JSON)
-- Type-safe (preserves int/float/binary distinctions)
+- Type-safe (_preserves_ int/float/binary distinctions) whilst JSON sends strings.
 - Fast encoding/decoding
 
 **Alternative: JSON**: use flag `--json` for browser compatibility (NATS supports WebSocket connections) but slightly larger payload size and slower encoding/decoding.
 
-### 2. Single-Threaded per Bridge
+### 2. Snapshot Compression (Optional)
+
+**Opt-in zstd compression** with `--zstd` flag:
+
+- **90-95% compression** for snapshots with per-table dictionaries
+- **2-3× smaller payloads** vs generic compression
+- **12× faster uploads** for large snapshots
+- Falls back to ~70% compression without dictionaries
+
+**When to use:**
+
+- Large table snapshots (>100MB)
+- Low-bandwidth clients (mobile, edge)
+- High data transfer costs
+
+See [COMPRESSION.md](COMPRESSION.md) for dictionary training and client integration.
+
+### 3. Single-Threaded per Bridge
 
 **Design choice:** One bridge instance = one replication slot = sequential processing
 
@@ -1573,7 +1594,7 @@ docker exec -it postgres psql -U postgres -c "
 
 **Planned enhancements:**:
 
-- [ ] Compression options (`--compress zstd`)
+- [X] Compression options (`--zstd`) with dictionnary (cf <https://github.com/ndrean/zig-zstd>) to reduce significantly the bandwidth by 80% and upload time 5-10x faster.
 - [ ] Metrics export to StatsD/InfluxDB
 - [ ] Integrate MySQL connector option?
 
