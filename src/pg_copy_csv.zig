@@ -1,5 +1,7 @@
 //! PostgreSQL COPY CSV format parser
 //!
+//! We use a CSV format for the snapshot data transferred via COPY command.
+//!
 //! Format: COPY (...) TO STDOUT WITH (FORMAT csv, HEADER true)
 //! - First line: column names (comma-separated)
 //! - Following lines: data rows (comma-separated, quoted if needed)
@@ -11,6 +13,32 @@ const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 
 pub const log = std.log.scoped(.pg_copy_csv);
+
+/// A row from CSV data
+pub const CsvRow = struct {
+    allocator: std.mem.Allocator,
+    fields: []CsvField,
+
+    pub fn deinit(self: *CsvRow) void {
+        for (self.fields) |csv_field| {
+            if (csv_field.value) |v| {
+                self.allocator.free(v);
+            }
+        }
+        self.allocator.free(self.fields);
+    }
+
+    pub fn getField(self: CsvRow, index: usize) ?CsvField {
+        if (index < self.fields.len) {
+            return self.fields[index];
+        }
+        return null;
+    }
+
+    pub fn fieldCount(self: CsvRow) usize {
+        return self.fields.len;
+    }
+};
 
 /// Parser for COPY CSV format
 pub const CopyCsvParser = struct {
@@ -35,7 +63,7 @@ pub const CopyCsvParser = struct {
         self.buffer.deinit(self.allocator);
     }
 
-    /// Execute PG_OPY command and read all data and parse header
+    /// Execute PG_COPY command and read all data and parse header
     pub fn executeCopy(self: *CopyCsvParser, query: [:0]const u8) !void {
         // Execute COPY command
         const result = c.PQexec(self.conn, query.ptr);
@@ -85,7 +113,7 @@ pub const CopyCsvParser = struct {
 
         // Find first newline
         const newline_pos = std.mem.indexOfScalar(u8, data, '\n') orelse {
-            if (data.len == 0) return; // Empty result set
+            if (data.len == 0) return;
             return error.NoHeaderFound;
         };
 
@@ -227,28 +255,342 @@ pub const CsvField = struct {
     }
 };
 
-/// A row from CSV data
-pub const CsvRow = struct {
-    fields: []CsvField,
-    allocator: std.mem.Allocator,
+// ========================================
+// Tests
+// ========================================
 
-    pub fn deinit(self: *CsvRow) void {
-        for (self.fields) |csv_field| {
-            if (csv_field.value) |v| {
-                self.allocator.free(v);
-            }
+test "CopyCsvParser - parse simple CSV line" {
+    const allocator = std.testing.allocator;
+
+    var parser = CopyCsvParser.init(allocator, null);
+    defer parser.deinit();
+
+    const line = "1,Alice,30";
+    const row = try parser.parseCsvLine(line);
+    defer {
+        var mut_row = row;
+        mut_row.deinit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), row.fieldCount());
+    try std.testing.expectEqualStrings("1", row.fields[0].value.?);
+    try std.testing.expectEqualStrings("Alice", row.fields[1].value.?);
+    try std.testing.expectEqualStrings("30", row.fields[2].value.?);
+}
+
+test "CopyCsvParser - parse CSV with NULL values" {
+    const allocator = std.testing.allocator;
+
+    var parser = CopyCsvParser.init(allocator, null);
+    defer parser.deinit();
+
+    // Test both empty field and \N for NULL
+    const line = "1,,\\N";
+    const row = try parser.parseCsvLine(line);
+    defer {
+        var mut_row = row;
+        mut_row.deinit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), row.fieldCount());
+    try std.testing.expectEqualStrings("1", row.fields[0].value.?);
+    try std.testing.expect(row.fields[1].isNull());
+    try std.testing.expect(row.fields[2].isNull());
+}
+
+test "CopyCsvParser - parse CSV with quoted values" {
+    const allocator = std.testing.allocator;
+
+    var parser = CopyCsvParser.init(allocator, null);
+    defer parser.deinit();
+
+    const line =
+        \\1,"Alice and Bob","Hello"
+    ;
+    const row = try parser.parseCsvLine(line);
+    defer {
+        var mut_row = row;
+        mut_row.deinit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), row.fieldCount());
+    try std.testing.expectEqualStrings("1", row.fields[0].value.?);
+    try std.testing.expectEqualStrings("Alice and Bob", row.fields[1].value.?);
+    try std.testing.expectEqualStrings("Hello", row.fields[2].value.?);
+}
+
+test "CopyCsvParser - parse CSV with escaped quotes" {
+    const allocator = std.testing.allocator;
+
+    var parser = CopyCsvParser.init(allocator, null);
+    defer parser.deinit();
+
+    // CSV format uses "" to escape quotes inside quoted strings
+    const line = "1,\"He said \"\"hello\"\"\",test";
+    const row = try parser.parseCsvLine(line);
+    defer {
+        var mut_row = row;
+        mut_row.deinit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), row.fieldCount());
+    try std.testing.expectEqualStrings("1", row.fields[0].value.?);
+    try std.testing.expectEqualStrings("He said \"hello\"", row.fields[1].value.?);
+    try std.testing.expectEqualStrings("test", row.fields[2].value.?);
+}
+
+test "CopyCsvParser - parse CSV with whitespace" {
+    const allocator = std.testing.allocator;
+
+    var parser = CopyCsvParser.init(allocator, null);
+    defer parser.deinit();
+
+    // CSV parser should trim whitespace around unquoted values
+    const line = " 1 , Alice , 30 ";
+    const row = try parser.parseCsvLine(line);
+    defer {
+        var mut_row = row;
+        mut_row.deinit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), row.fieldCount());
+    try std.testing.expectEqualStrings("1", row.fields[0].value.?);
+    try std.testing.expectEqualStrings("Alice", row.fields[1].value.?);
+    try std.testing.expectEqualStrings("30", row.fields[2].value.?);
+}
+
+test "CopyCsvParser - parse header from buffer" {
+    const allocator = std.testing.allocator;
+
+    var parser = CopyCsvParser.init(allocator, null);
+    defer parser.deinit();
+
+    // Simulate COPY CSV data with header
+    const csv_data = "id,name,age\n1,Alice,30\n2,Bob,25\n";
+    try parser.buffer.appendSlice(allocator, csv_data);
+
+    try parser.parseHeader();
+
+    const header = parser.columnNames().?;
+    try std.testing.expectEqual(@as(usize, 3), header.len);
+    try std.testing.expectEqualStrings("id", header[0]);
+    try std.testing.expectEqualStrings("name", header[1]);
+    try std.testing.expectEqualStrings("age", header[2]);
+}
+
+test "CopyCsvParser - row iterator" {
+    const allocator = std.testing.allocator;
+
+    var parser = CopyCsvParser.init(allocator, null);
+    defer parser.deinit();
+
+    // Simulate COPY CSV data
+    const csv_data = "id,name,age\n1,Alice,30\n2,Bob,25\n3,Carol,35\n";
+    try parser.buffer.appendSlice(allocator, csv_data);
+
+    try parser.parseHeader();
+
+    // Iterate through rows
+    var row_count: usize = 0;
+    var iterator = parser.rows();
+
+    while (try iterator.next()) |row| {
+        defer {
+            var mut_row = row;
+            mut_row.deinit();
         }
-        self.allocator.free(self.fields);
-    }
+        row_count += 1;
 
-    pub fn getField(self: CsvRow, index: usize) ?CsvField {
-        if (index < self.fields.len) {
-            return self.fields[index];
+        try std.testing.expectEqual(@as(usize, 3), row.fieldCount());
+
+        // Check first row
+        if (row_count == 1) {
+            try std.testing.expectEqualStrings("1", row.fields[0].value.?);
+            try std.testing.expectEqualStrings("Alice", row.fields[1].value.?);
+            try std.testing.expectEqualStrings("30", row.fields[2].value.?);
         }
-        return null;
+
+        // Check second row
+        if (row_count == 2) {
+            try std.testing.expectEqualStrings("2", row.fields[0].value.?);
+            try std.testing.expectEqualStrings("Bob", row.fields[1].value.?);
+            try std.testing.expectEqualStrings("25", row.fields[2].value.?);
+        }
+
+        // Check third row
+        if (row_count == 3) {
+            try std.testing.expectEqualStrings("3", row.fields[0].value.?);
+            try std.testing.expectEqualStrings("Carol", row.fields[1].value.?);
+            try std.testing.expectEqualStrings("35", row.fields[2].value.?);
+        }
     }
 
-    pub fn fieldCount(self: CsvRow) usize {
-        return self.fields.len;
+    try std.testing.expectEqual(@as(usize, 3), row_count);
+}
+
+test "CopyCsvParser - empty result set" {
+    const allocator = std.testing.allocator;
+
+    var parser = CopyCsvParser.init(allocator, null);
+    defer parser.deinit();
+
+    // Only header, no data rows
+    const csv_data = "id,name,age\n";
+    try parser.buffer.appendSlice(allocator, csv_data);
+
+    try parser.parseHeader();
+
+    var iterator = parser.rows();
+    const first_row = try iterator.next();
+    try std.testing.expect(first_row == null);
+}
+
+test "CopyCsvParser - row with mixed NULL and values" {
+    const allocator = std.testing.allocator;
+
+    var parser = CopyCsvParser.init(allocator, null);
+    defer parser.deinit();
+
+    const line = "1,Alice,,35,\\N,\"quoted value\"";
+    const row = try parser.parseCsvLine(line);
+    defer {
+        var mut_row = row;
+        mut_row.deinit();
     }
-};
+
+    try std.testing.expectEqual(@as(usize, 6), row.fieldCount());
+    try std.testing.expectEqualStrings("1", row.fields[0].value.?);
+    try std.testing.expectEqualStrings("Alice", row.fields[1].value.?);
+    try std.testing.expect(row.fields[2].isNull());
+    try std.testing.expectEqualStrings("35", row.fields[3].value.?);
+    try std.testing.expect(row.fields[4].isNull());
+    try std.testing.expectEqualStrings("quoted value", row.fields[5].value.?);
+}
+
+test "CopyCsvParser - unescape CSV double quotes" {
+    const allocator = std.testing.allocator;
+
+    var parser = CopyCsvParser.init(allocator, null);
+    defer parser.deinit();
+
+    // Test unescaping "" -> "
+    const input = "This is a \"\"quoted\"\" word";
+    const result = try parser.unescapeCsv(input);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("This is a \"quoted\" word", result);
+}
+
+test "CopyCsvParser - unescape multiple consecutive quotes" {
+    const allocator = std.testing.allocator;
+
+    var parser = CopyCsvParser.init(allocator, null);
+    defer parser.deinit();
+
+    // Test """" -> ""
+    const input = "\"\"\"\"";
+    const result = try parser.unescapeCsv(input);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("\"\"", result);
+}
+
+test "CopyCsvParser - complex CSV with all features" {
+    const allocator = std.testing.allocator;
+
+    var parser = CopyCsvParser.init(allocator, null);
+    defer parser.deinit();
+
+    // Complex CSV: quoted values, NULLs, escaped quotes
+    const csv_data =
+        \\id,name,email,bio,age
+        \\1,Alice,alice@example.com,"A software engineer who said ""hello world!""",30
+        \\2,"Bob Smith",,\N,25
+        \\3,Carol,carol@test.com,"Lives in Portland OR",35
+        \\
+    ;
+
+    try parser.buffer.appendSlice(allocator, csv_data);
+    try parser.parseHeader();
+
+    const header = parser.columnNames().?;
+    try std.testing.expectEqual(@as(usize, 5), header.len);
+
+    var row_count: usize = 0;
+    var iterator = parser.rows();
+
+    // Row 1: Alice with complex bio
+    if (try iterator.next()) |row| {
+        defer {
+            var mut_row = row;
+            mut_row.deinit();
+        }
+        row_count += 1;
+
+        try std.testing.expectEqualStrings("1", row.fields[0].value.?);
+        try std.testing.expectEqualStrings("Alice", row.fields[1].value.?);
+        try std.testing.expectEqualStrings("alice@example.com", row.fields[2].value.?);
+        try std.testing.expectEqualStrings("A software engineer who said \"hello world!\"", row.fields[3].value.?);
+        try std.testing.expectEqualStrings("30", row.fields[4].value.?);
+    }
+
+    // Row 2: Bob with NULLs
+    if (try iterator.next()) |row| {
+        defer {
+            var mut_row = row;
+            mut_row.deinit();
+        }
+        row_count += 1;
+
+        try std.testing.expectEqualStrings("2", row.fields[0].value.?);
+        try std.testing.expectEqualStrings("Bob Smith", row.fields[1].value.?);
+        try std.testing.expect(row.fields[2].isNull());
+        try std.testing.expect(row.fields[3].isNull());
+        try std.testing.expectEqualStrings("25", row.fields[4].value.?);
+    }
+
+    // Row 3: Carol with quoted bio
+    if (try iterator.next()) |row| {
+        defer {
+            var mut_row = row;
+            mut_row.deinit();
+        }
+        row_count += 1;
+
+        try std.testing.expectEqualStrings("3", row.fields[0].value.?);
+        try std.testing.expectEqualStrings("Carol", row.fields[1].value.?);
+        try std.testing.expectEqualStrings("carol@test.com", row.fields[2].value.?);
+        try std.testing.expectEqualStrings("Lives in Portland OR", row.fields[3].value.?);
+        try std.testing.expectEqualStrings("35", row.fields[4].value.?);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), row_count);
+}
+
+test "CopyCsvParser - getField by index" {
+    const allocator = std.testing.allocator;
+
+    var parser = CopyCsvParser.init(allocator, null);
+    defer parser.deinit();
+
+    const line = "1,Alice,30";
+    const row = try parser.parseCsvLine(line);
+    defer {
+        var mut_row = row;
+        mut_row.deinit();
+    }
+
+    // Valid indices
+    const field0 = row.getField(0).?;
+    try std.testing.expectEqualStrings("1", field0.value.?);
+
+    const field1 = row.getField(1).?;
+    try std.testing.expectEqualStrings("Alice", field1.value.?);
+
+    const field2 = row.getField(2).?;
+    try std.testing.expectEqualStrings("30", field2.value.?);
+
+    // Out of bounds
+    const field_oob = row.getField(10);
+    try std.testing.expect(field_oob == null);
+}

@@ -163,8 +163,20 @@ pub const Snapshot = struct {
     /// NATS subject pattern for data chunks: "init.snap.<table>.<snapshot_id>.<chunk>"
     pub const data_subject_pattern = "init.snap.{s}.{s}.{d}";
 
+    /// NATS subject pattern for snapshot start notification: "init.start.<table>"
+    pub const start_subject_pattern = "init.start.{s}";
+
+    /// NATS subject pattern for snapshot errors: "init.error.<table>"
+    pub const error_subject_pattern = "init.error.{s}";
+
     /// NATS subject pattern for metadata: "init.meta.<table>"
     pub const meta_subject_pattern = "init.meta.{s}";
+
+    /// NATS KV bucket name for schemas
+    pub const kv_bucket_schemas = "schemas";
+
+    /// NATS KV bucket name for zstd dictionaries
+    pub const kv_bucket_dictionaries = "dictionaries";
 
     /// Message ID pattern for data chunks: "init-<table>-<snapshot_id>-<chunk>"
     pub const data_msg_id_pattern = "init-{s}-{s}-{d}";

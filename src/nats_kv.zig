@@ -91,17 +91,16 @@ pub const KVStore = struct {
 
         defer c.kvEntry_Destroy(@ptrCast(entry));
 
-        // Get value data
-        var value_ptr: [*c]const u8 = undefined;
-        var value_len: i64 = 0;
-        const value_status = c.kvEntry_Value(
-            @ptrCast(entry),
-            &value_ptr,
-            &value_len,
-        );
-
-        if (value_status != c.NATS_OK) {
+        // Get value data (kvEntry_Value returns pointer directly)
+        const value_ptr: [*c]const u8 = @ptrCast(c.kvEntry_Value(@ptrCast(entry)));
+        if (value_ptr == null) {
             return error.KVValueFailed;
+        }
+
+        // Get value length
+        const value_len = c.kvEntry_ValueLen(@ptrCast(entry));
+        if (value_len <= 0) {
+            return null; // Empty value
         }
 
         // Copy the value (caller owns the memory)

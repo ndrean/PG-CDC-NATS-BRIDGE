@@ -9,12 +9,9 @@ END;
 $$;
 
 GRANT CONNECT ON DATABASE ${TARGET_DB} TO ${POSTGRES_BRIDGE_USER};
-GRANT CREATE ON DATABASE ${TARGET_DB} TO ${POSTGRES_BRIDGE_USER};
-GRANT USAGE ON SCHEMA public TO ${POSTGRES_BRIDGE_USER};
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${POSTGRES_BRIDGE_USER};
 
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-    GRANT SELECT ON TABLES TO ${POSTGRES_BRIDGE_USER};
+GRANT USAGE ON SCHEMA public TO ${POSTGRES_BRIDGE_USER};
+
 
 DO $$
 BEGIN
@@ -54,11 +51,22 @@ BEGIN
     FOREACH table_name IN ARRAY tables_array
     LOOP
         IF NOT EXISTS (
-            SELECT 1 FROM pg_publication_tables
+            SELECT 1 
+            FROM pg_publication_tables
             WHERE pubname = '${BRIDGE_CDC_PUBLICATION}'
             AND tablename = trim(table_name)
         ) THEN
-            EXECUTE format('ALTER PUBLICATION ${BRIDGE_CDC_PUBLICATION} ADD TABLE %I', trim(table_name));
+            EXECUTE format(
+                'ALTER PUBLICATION %I ADD TABLE public.%I',
+                '${BRIDGE_CDC_PUBLICATION}',
+                trim(lower(table_name))
+            );
         END IF;
+
+        EXECUTE FORMAT(
+            'GRANT SELECT ON TABLE public.%I TO %I',
+            trim(table_name),
+            '${POSTGRES_BRIDGE_USER}'
+        );
     END LOOP;
 END $$;

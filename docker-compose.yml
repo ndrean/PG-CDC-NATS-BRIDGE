@@ -107,6 +107,11 @@ services:
         echo 'Creating NATS KV bucket: schemas'
         nats kv add schemas --server=nats://${NATS_BRIDGE_USER}:${NATS_BRIDGE_PASSWORD}@nats-server:4222 --history=10 --replicas=1 || true
         echo 'KV bucket schemas created successfully'
+
+        echo 'Creating NATS KV bucket: dictionaries'
+        nats kv add dictionaries --server=nats://${NATS_BRIDGE_USER}:${NATS_BRIDGE_PASSWORD}@nats-server:4222 --history=10 --replicas=1 || true
+        echo 'KV bucket dictionaries created successfully'
+
         echo 'NATS initialization complete - exiting'
         exit 0
     restart: "no"

@@ -44,39 +44,42 @@ defmodule Consumer.Init do
 
   @impl true
   def handle_message(message, state) do
-    dbg(message.topic)
-    format = :persistent_term.get(:format)
+    if message.topic == "init.start.users" do
+      Logger.info("[Start] init.start.users ---------------> #{System.system_time(:microsecond)}")
+    end
+
+    # format = :persistent_term.get(:format)
 
     try do
       Task.Supervisor.start_child(MyTaskSupervisor, fn ->
-        byte_size(message.body) |> dbg()
-
-        decoded =
-          case format do
-            "json" ->
-              _decoded = Jason.decode!(message.body)
-
-            "msgpack" ->
-              _decoded = Msgpax.unpack!(message.body)
-          end
-
-        # TODO: insert into DB based on schema in state
-        data = decoded["data"]
-
-        len =
-          case is_list(data) do
-            true -> length(data)
-            _ -> 0
-          end
-
         Logger.info(
-          "[INIT Consumer] #{System.system_time(:microsecond)} Processed snapshot chunk with #{len} records"
+          "[Chunk] #{message.topic}: #{byte_size(message.body)}-----> #{System.system_time(:microsecond)}"
         )
 
-        Logger.info("[INIT Consumer] Processed snapshot chunk message:  #{inspect(decoded)}")
-      end)
+        #   decoded =
+        #     case format do
+        #       "json" ->
+        #         _decoded = Jason.decode!(message.body)
 
-      System.system_time(:microsecond) |> dbg()
+        #       "msgpack" ->
+        #         _decoded = Msgpax.unpack!(message.body)
+        #     end
+
+        #   # TODO: insert into DB based on schema in state
+        #   data = decoded["data"]
+
+        #   len =
+        #     case is_list(data) do
+        #       true -> length(data)
+        #       _ -> 0
+        #     end
+
+        #   Logger.info(
+        #     "[INIT Consumer] #{System.system_time(:microsecond)} Processed snapshot chunk with #{len} records"
+        #   )
+
+        #   Logger.info("[INIT Consumer] Processed snapshot chunk message:  #{inspect(decoded)}")
+      end)
 
       {:ack, state}
     rescue
@@ -216,8 +219,6 @@ defmodule Consumer.Init do
         nil -> ["users", "test_types"]
         tables_str -> String.split(tables_str, ",") |> Enum.map(&String.trim/1)
       end
-
-    System.system_time(:microsecond) |> dbg()
 
     # Request snapshot for each table
     Enum.each(tables, fn table_name ->

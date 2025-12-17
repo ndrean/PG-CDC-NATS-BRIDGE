@@ -6,7 +6,7 @@ const wal_stream = @import("wal_stream.zig");
 const pgoutput = @import("pgoutput.zig");
 const nats_publisher = @import("nats_publisher.zig");
 const batch_publisher = @import("batch_publisher.zig");
-const async_batch_publisher = @import("async_batch_publisher.zig");
+const event_processor = @import("event_processor.zig");
 const replication_setup = @import("replication_setup.zig");
 const msgpack = @import("msgpack");
 const http_server = @import("http_server.zig");
@@ -19,6 +19,12 @@ const schema_cache_mod = @import("schema_cache.zig");
 const publication_mod = @import("publication.zig");
 const snapshot_listener = @import("snapshot_listener.zig");
 const encoder_mod = @import("encoder.zig");
+
+// Force test discovery for imported modules
+comptime {
+    _ = @import("pg_copy_csv.zig");
+    _ = @import("dictionaries_cache.zig");
+}
 
 pub const log = std.log.scoped(.bridge);
 
@@ -77,14 +83,14 @@ fn initBatchPublisher(
     format: encoder_mod.Format,
     metrics: *metrics_mod.Metrics,
     runtime_config: *const Config.RuntimeConfig,
-) !async_batch_publisher.AsyncBatchPublisher {
+) !batch_publisher.BatchPublisher {
     const batch_config = batch_publisher.BatchConfig{
         .max_events = runtime_config.batch_max_events,
         .max_wait_ms = runtime_config.batch_max_wait_ms,
         .max_payload_bytes = runtime_config.batch_max_payload_bytes,
     };
 
-    return try async_batch_publisher.AsyncBatchPublisher.init(
+    return try batch_publisher.BatchPublisher.init(
         allocator,
         publisher,
         batch_config,
@@ -159,7 +165,6 @@ pub fn main() !void {
     const parsed_args = parsed.args;
     var runtime_config = parsed.runtime_config;
     defer runtime_config.deinit(allocator);
-    log.debug("{}", .{runtime_config});
 
     // Create null-terminated versions for C APIs (kept alive for entire program)
     const slot_name_z = try allocator.dupeZ(u8, parsed_args.slot_name);
@@ -188,7 +193,7 @@ pub fn main() !void {
     // === Initialize metrics
     var metrics = metrics_mod.Metrics.init();
 
-    // === Initialize HTTP server (at final memory location)
+    // === Start thread: HTTP server (at final memory location)
     var http_srv = try initHttpServer(
         allocator,
         parsed_args.http_port,
@@ -204,7 +209,7 @@ pub fn main() !void {
     // PostgreSQL connection configuration from RuntimeConfig
     var pg_config = pg_conn.PgConf.from_runtime_config(&runtime_config);
 
-    // === Initialize replication: create slot + verify publication
+    // Initialize replication: create slot + verify publication
     var replication_ctx = try initReplication(
         allocator,
         &pg_config,
@@ -213,7 +218,7 @@ pub fn main() !void {
     );
     defer replication_ctx.deinit();
 
-    // === Start WAL lag monitor in background thread
+    // === Start thread: WAL lag monitor
     const wal_monitor_config = wal_monitor.WalConfig{
         .pg_config = &pg_config,
         .slot_name = parsed_args.slot_name,
@@ -253,7 +258,19 @@ pub fn main() !void {
         parsed_args.encoding_format,
     );
 
-    // === Start snapshot listener background thread
+    // Initialize dictionaries from NATS KV if compression is enabled
+    if (runtime_config.enable_compression) {
+        snapshot_listener.initializeDictionaries(
+            allocator,
+            publisher.js, // JetStream context
+            monitored_tables,
+        ) catch |err| {
+            log.warn("⚠️  Dictionary initialization failed: {} (compression will work without dictionaries)", .{err});
+            // Continue without dictionaries - graceful degradation
+        };
+    }
+
+    // === Start thread: snapshot listener
     log.info("Starting snapshot listener thread...", .{});
     var snap_listener = snapshot_listener.SnapshotListener.init(
         allocator,
@@ -263,15 +280,18 @@ pub fn main() !void {
         monitored_tables,
         parsed_args.encoding_format,
         &runtime_config,
+        publisher.js, // Pass JetStream context for dictionary fetching
     );
     try snap_listener.start();
     defer snap_listener.join();
     defer snap_listener.deinit();
     log.info("✅ Snapshot listener thread started\n", .{});
 
-    // === Initialize CDC async publisher (at final memory location)
+    // === Start thread: CDC async publisher (at final memory location)
+    // Use c_allocator (thread-safe) for cross-thread allocations:
+    // Main thread allocates CDC event data, flush thread deallocates it
     var batch_pub = try initBatchPublisher(
-        allocator,
+        std.heap.c_allocator,
         &publisher,
         parsed_args.encoding_format,
         &metrics,
@@ -281,6 +301,14 @@ pub fn main() !void {
     try batch_pub.start();
     defer batch_pub.join();
     defer batch_pub.deinit();
+
+    // === Initialize EventProcessor (main thread CDC processor)
+    // EventProcessor enqueues to the SPSC queue that BatchPublisher consumes
+    var event_proc = event_processor.EventProcessor.init(
+        std.heap.c_allocator, // Use thread-safe allocator for cross-thread data
+        &batch_pub.event_queue, // Reference to the SPSC queue
+        &metrics,
+    );
 
     const batch_config = batch_publisher.BatchConfig{
         .max_events = Config.Batch.max_events,
@@ -293,7 +321,7 @@ pub fn main() !void {
         batch_config.max_payload_bytes / 1024,
     });
 
-    // === Connect to replication stream
+    // Connect to replication stream
     var pg_stream = try initReplicationStream(
         allocator,
         &pg_config,
@@ -305,7 +333,6 @@ pub fn main() !void {
     // Mark as connected in metrics
     metrics.setConnected(true);
 
-    // 5. Stream CDC events to NATS
     // CDC events are published to subjects like "cdc.table.operation"
     log.info("ℹ️ Subject pattern: \x1b[1m {s} \x1b[0m", .{Config.Nats.cdc_subject_wildcard});
 
@@ -333,7 +360,7 @@ pub fn main() !void {
     const idle_check_interval: u32 = 10; // Check time every 10 iterations (~100ms)
     // --->
 
-    // === Track relation metadata (table info)
+    // Track relation metadata (table info)
     var relation_map = std.AutoHashMap(u32, pgoutput.RelationMessage).init(allocator);
     defer {
         var it = relation_map.valueIterator();
@@ -379,8 +406,8 @@ pub fn main() !void {
                 // Parse and publish pgoutput messages
                 if (wal_msg.type == .xlogdata and wal_msg.payload.len > 0) {
                     // Reset arena for this message (retains capacity for efficiency)
-                    // This frees all allocations from previous message while keeping the memory buffer
-                    defer _ = arena.reset(.retain_capacity);
+                    // reset allocations from previous message while keeping the memory buffer
+                    _ = arena.reset(.retain_capacity);
                     const arena_allocator = arena.allocator();
 
                     // Parse messages with arena allocator
@@ -423,7 +450,7 @@ pub fn main() !void {
                             .insert => |ins| {
                                 // tupleData contains the new row values
                                 if (relation_map.get(ins.relation_id)) |rel| {
-                                    try batch_pub.processCdcEvent(
+                                    try event_proc.processCdcEvent(
                                         rel,
                                         ins.tuple_data,
                                         "INSERT",
@@ -434,7 +461,7 @@ pub fn main() !void {
                             },
                             .update => |upd| {
                                 if (relation_map.get(upd.relation_id)) |rel| {
-                                    try batch_pub.processCdcEvent(
+                                    try event_proc.processCdcEvent(
                                         rel,
                                         upd.new_tuple,
                                         "UPDATE",
@@ -445,7 +472,7 @@ pub fn main() !void {
                             },
                             .delete => |del| {
                                 if (relation_map.get(del.relation_id)) |rel| {
-                                    try batch_pub.processCdcEvent(
+                                    try event_proc.processCdcEvent(
                                         rel,
                                         del.old_tuple,
                                         "DELETE",

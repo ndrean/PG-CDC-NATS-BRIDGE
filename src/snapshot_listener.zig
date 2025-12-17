@@ -16,6 +16,7 @@ const msgpack = @import("msgpack");
 const pg_copy_csv = @import("pg_copy_csv.zig");
 const encoder_mod = @import("encoder.zig");
 const zstd = @import("zstd");
+const nats_kv = @import("nats_kv.zig");
 const RuntimeConfig = @import("config.zig").RuntimeConfig;
 
 pub const log = std.log.scoped(.snapshot_listener);
@@ -30,6 +31,7 @@ const SnapshotContext = struct {
     chunk_size: usize,
     enable_compression: bool,
     recipe: config.CompressionRecipe,
+    js_ctx: ?*anyopaque, // JetStream context for KV access
 };
 
 /// Snapshot listener with thread management
@@ -44,6 +46,7 @@ pub const SnapshotListener = struct {
     chunk_size: usize,
     enable_compression: bool,
     recipe: config.CompressionRecipe,
+    js_ctx: ?*anyopaque, // JetStream context for dictionary fetching
 
     /// Initialize snapshot listener (does not start the thread)
     pub fn init(
@@ -54,6 +57,7 @@ pub const SnapshotListener = struct {
         monitored_tables: []const []const u8,
         format: encoder_mod.Format,
         runtime_config: *const config.RuntimeConfig,
+        js_ctx: ?*anyopaque,
     ) SnapshotListener {
         return .{
             .allocator = allocator,
@@ -66,6 +70,7 @@ pub const SnapshotListener = struct {
             .chunk_size = runtime_config.snapshot_chunk_size,
             .enable_compression = runtime_config.enable_compression,
             .recipe = runtime_config.recipe,
+            .js_ctx = js_ctx,
         };
     }
 
@@ -103,6 +108,7 @@ pub const SnapshotListener = struct {
             self.chunk_size,
             self.enable_compression,
             self.recipe,
+            self.js_ctx,
         );
     }
 };
@@ -114,20 +120,36 @@ fn publishSnapshotError(
     table_name: []const u8,
     error_type: []const u8,
     available_tables: []const []const u8,
+    snapshot_id: ?[]const u8,
+    error_message: ?[]const u8,
+    format: encoder_mod.Format,
 ) !void {
-    // Build error subject: init.error.{table}
-    const subject = try std.fmt.allocPrint(allocator, "init.error.{s}", .{table_name});
+    const subject = try std.fmt.allocPrintSentinel(
+        allocator,
+        config.Snapshot.error_subject_pattern,
+        .{table_name},
+        0,
+    );
     defer allocator.free(subject);
 
-    // Use unified encoder (always MessagePack for snapshots)
-    var encoder = encoder_mod.Encoder.init(allocator, .msgpack);
+    var encoder = encoder_mod.Encoder.init(allocator, format);
     defer encoder.deinit();
 
     var map = encoder.createMap();
     defer map.free(allocator);
 
-    try map.put("error", try encoder.createString(error_type));
+    try map.put("error_type", try encoder.createString(error_type));
     try map.put("table", try encoder.createString(table_name));
+    try map.put("timestamp", encoder.createInt(std.time.timestamp()));
+    try map.put("status", try encoder.createString("failed"));
+
+    // Optional fields
+    if (snapshot_id) |sid| {
+        try map.put("snapshot_id", try encoder.createString(sid));
+    }
+    if (error_message) |msg| {
+        try map.put("error_message", try encoder.createString(msg));
+    }
 
     // Create array for available_tables
     var tables_array = try encoder.createArray(available_tables.len);
@@ -139,10 +161,10 @@ fn publishSnapshotError(
     const payload = try encoder.encode(map);
     defer allocator.free(payload);
 
-    // Publish error message
     try publisher.publish(subject, payload, null);
+    try publisher.flushAsync();
 
-    log.info("📤 Published snapshot error for table '{s}' to {s}", .{ table_name, subject });
+    log.err("❌ Published snapshot error → {s}: {s}", .{ subject, error_type });
 }
 
 /// NATS message callback for snapshot requests
@@ -185,6 +207,9 @@ fn onSnapshotRequest(
             table_name,
             "table_not_in_publication",
             ctx.monitored_tables,
+            null, // no snapshot_id yet
+            null, // no error_message
+            ctx.format,
         ) catch |err| {
             log.err("Failed to publish snapshot error: {}", .{err});
         };
@@ -228,8 +253,33 @@ fn onSnapshotRequest(
         ctx.chunk_size,
         ctx.enable_compression,
         ctx.recipe,
+        ctx.js_ctx, // Pass JetStream context for dictionary fetching
     ) catch |err| {
+        const error_message = std.fmt.allocPrint(
+            ctx.allocator,
+            "Snapshot generation failed: {}",
+            .{err},
+        ) catch "Unknown error";
+        defer if (!std.mem.eql(u8, error_message, "Unknown error")) {
+            ctx.allocator.free(error_message);
+        };
+
         log.err("Snapshot generation failed for table '{s}': {}", .{ table_name, err });
+
+        // Publish error notification to NATS for consumer feedback
+        publishSnapshotError(
+            ctx.allocator,
+            ctx.publisher,
+            table_name,
+            @errorName(err),
+            ctx.monitored_tables,
+            snapshot_id,
+            error_message,
+            ctx.format,
+        ) catch |pub_err| {
+            log.err("Failed to publish snapshot error notification: {}", .{pub_err});
+        };
+
         return;
     };
 
@@ -247,6 +297,7 @@ pub fn listenForSnapshotRequests(
     chunk_size: usize,
     enable_compression: bool,
     recipe: config.CompressionRecipe,
+    js_ctx: ?*anyopaque, // JetStream context for dictionary fetching
 ) !void {
     log.info("🔔 Starting NATS snapshot listener thread", .{});
 
@@ -260,6 +311,7 @@ pub fn listenForSnapshotRequests(
         .chunk_size = chunk_size,
         .enable_compression = enable_compression,
         .recipe = recipe,
+        .js_ctx = js_ctx,
     };
 
     // Subscribe to snapshot.request.> (wildcard for all tables)
@@ -326,11 +378,21 @@ fn generateIncrementalSnapshot(
     chunk_size: usize,
     enable_compression: bool,
     recipe: config.CompressionRecipe,
+    js_ctx: ?*anyopaque, // JetStream context for KV access (optional)
 ) !void {
     log.info("🔄 Generating incremental snapshot for table '{s}' (snapshot_id={s})", .{
         table_name,
         snapshot_id,
     });
+
+    // Fetch dictionary from NATS KV if compression is enabled
+    const dict_entry = if (enable_compression and js_ctx != null) blk: {
+        break :blk try fetchDictionary(allocator, js_ctx.?, table_name);
+    } else null;
+    defer if (dict_entry) |entry| {
+        allocator.free(entry.dict_id);
+        allocator.free(entry.data);
+    };
 
     // Create a separate connection for snapshot query
     const conninfo = try pg_config.connInfo(allocator, false);
@@ -364,12 +426,27 @@ fn generateIncrementalSnapshot(
         return error.QueryFailed;
     }
 
-    const lsn_str = std.mem.span(c.PQgetvalue(lsn_result, 0, 0));
+    const lsn_str: []const u8 = std.mem.span(c.PQgetvalue(lsn_result, 0, 0));
 
     log.info("📸 Snapshot transaction started at LSN: {s}", .{lsn_str});
 
+    // Publish snapshot start notification with LSN watermark
+    // Consumers use this to filter CDC events with LSN < snapshot_lsn
+    const dict_id_opt = if (dict_entry) |entry| entry.dict_id else null;
+    publishSnapshotStart(
+        allocator,
+        publisher,
+        table_name,
+        snapshot_id,
+        lsn_str,
+        format,
+        dict_id_opt,
+        enable_compression,
+    ) catch |err| {
+        log.warn("Failed to publish snapshot start notification: {}", .{err});
+    };
+
     // Create arena allocator for snapshot processing (reused across all chunks)
-    // This significantly reduces allocation overhead for CSV parsing and MessagePack encoding
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
@@ -381,7 +458,7 @@ fn generateIncrementalSnapshot(
 
     while (true) {
         // Reset arena for this chunk (retains capacity for efficiency)
-        defer _ = arena.reset(.retain_capacity);
+        _ = arena.reset(.retain_capacity);
         const chunk_alloc = arena.allocator();
 
         // Build COPY CSV query with WHERE id > last_id for efficient chunking
@@ -402,6 +479,7 @@ fn generateIncrementalSnapshot(
 
         parser.executeCopy(copy_query) catch |err| {
             log.err("COPY CSV command failed: {}", .{err});
+            _ = c.PQexec(conn, "ROLLBACK");
             return error.CopyFailed;
         };
 
@@ -428,7 +506,7 @@ fn generateIncrementalSnapshot(
         const col_names = parser.columnNames() orelse return error.NoHeader;
 
         // Encode chunk as MessagePack with metadata wrapper using arena allocator
-        const encoded = try encodeCsvRowsToMessagePack(
+        const encoded = try encodeCsvRows(
             chunk_alloc,
             rows_list.items,
             col_names,
@@ -446,12 +524,19 @@ fn generateIncrementalSnapshot(
             const cctx = try zstd.init_compressor(.{ .recipe = zstd_recipe });
             defer _ = zstd.free_compressor(cctx);
 
+            // Load dictionary if available (improves compression ratio significantly)
+            if (dict_entry) |entry| {
+                _ = try zstd.load_compression_dictionary(cctx, entry.data);
+            }
+
             const compressed = try zstd.compress(allocator, cctx, encoded);
-            log.info("🗜️  Compressed chunk {d}: {d} → {d} bytes ({d:.1}% reduction)", .{
+            const compression_note = if (dict_entry != null) "with dictionary" else "without dictionary";
+            log.info("🗜️  Compressed chunk {d}: {d} → {d} bytes ({d:.1}% reduction, {s})", .{
                 batch,
                 encoded.len,
                 compressed.len,
                 @as(f64, @floatFromInt(encoded.len - compressed.len)) / @as(f64, @floatFromInt(encoded.len)) * 100.0,
+                compression_note,
             });
             break :blk compressed;
         } else encoded;
@@ -525,6 +610,8 @@ fn generateIncrementalSnapshot(
         batch,
         total_rows,
         format,
+        dict_id_opt,
+        enable_compression,
     );
 
     log.info("✅ Snapshot complete: {s} ({d} batches, {d} rows)", .{
@@ -534,80 +621,6 @@ fn generateIncrementalSnapshot(
     });
 }
 
-/// Encode PostgreSQL result set to MessagePack array
-fn encodeChunkToMessagePack(result: ?*c.PGresult, allocator: std.mem.Allocator) ![]const u8 {
-    const num_rows = c.PQntuples(result);
-    const num_cols = c.PQnfields(result);
-
-    var buffer = std.ArrayList(u8).empty;
-    defer buffer.deinit(allocator);
-
-    const ArrayListStream = struct {
-        allocator: std.mem.Allocator,
-        list: *std.ArrayList(u8),
-
-        const WriteError = std.mem.Allocator.Error;
-        const ReadError = error{};
-
-        pub fn write(self: *@This(), bytes: []const u8) WriteError!usize {
-            try self.list.appendSlice(self.allocator, bytes);
-            return bytes.len;
-        }
-
-        pub fn read(self: *@This(), out: []u8) ReadError!usize {
-            _ = self;
-            _ = out;
-            return 0;
-        }
-    };
-
-    var write_stream = ArrayListStream{
-        .list = &buffer,
-        .allocator = allocator,
-    };
-    var read_stream = ArrayListStream{
-        .list = &buffer,
-        .allocator = allocator,
-    };
-
-    var packer = msgpack.Pack(
-        *ArrayListStream,
-        *ArrayListStream,
-        ArrayListStream.WriteError,
-        ArrayListStream.ReadError,
-        ArrayListStream.write,
-        ArrayListStream.read,
-    ).init(&write_stream, &read_stream);
-
-    // Encode as array of maps
-    var rows_array = try msgpack.Payload.arrPayload(@intCast(num_rows), allocator);
-    defer rows_array.free(allocator);
-
-    for (0..@intCast(num_rows)) |row| {
-        var row_map = msgpack.Payload.mapPayload(allocator);
-
-        for (0..@intCast(num_cols)) |col| {
-            // Column name
-            const col_name = c.PQfname(result, @intCast(col));
-            const col_name_slice = std.mem.span(col_name);
-
-            // Column value
-            if (c.PQgetisnull(result, @intCast(row), @intCast(col)) == 1) {
-                try row_map.mapPut(col_name_slice, msgpack.Payload{ .nil = {} });
-            } else {
-                const value = c.PQgetvalue(result, @intCast(row), @intCast(col));
-                const value_slice = std.mem.span(value);
-                try row_map.mapPut(col_name_slice, try msgpack.Payload.strToPayload(value_slice, allocator));
-            }
-        }
-
-        rows_array.arr[row] = row_map;
-    }
-
-    try packer.write(rows_array);
-    return try buffer.toOwnedSlice(allocator);
-}
-
 /// Parse PostgreSQL LSN format (e.g., "0/17FBE78") to u64
 /// PostgreSQL LSN format: "segment/offset" where both are hex numbers
 fn parsePgLsn(lsn_str: []const u8) !u64 {
@@ -615,7 +628,7 @@ fn parsePgLsn(lsn_str: []const u8) !u64 {
     const slash_pos = std.mem.indexOfScalar(u8, lsn_str, '/') orelse return error.InvalidLsnFormat;
 
     const segment_str = lsn_str[0..slash_pos];
-    const offset_str = lsn_str[slash_pos + 1..];
+    const offset_str = lsn_str[slash_pos + 1 ..];
 
     // Parse both parts as hex
     const segment = try std.fmt.parseInt(u32, segment_str, 16);
@@ -627,7 +640,7 @@ fn parsePgLsn(lsn_str: []const u8) !u64 {
 
 /// Encode CSV rows to MessagePack with metadata wrapper
 /// Wraps snapshot data with table name, operation type, LSN, and chunk info
-fn encodeCsvRowsToMessagePack(
+fn encodeCsvRows(
     allocator: std.mem.Allocator,
     rows: []const pg_copy_csv.CsvRow,
     col_names: [][]const u8,
@@ -693,6 +706,8 @@ fn publishSnapshotMetadata(
     batch_count: u32,
     row_count: u64,
     format: encoder_mod.Format,
+    dictionary_id: ?[]const u8,
+    compression_enabled: bool,
 ) !void {
     // Use unified encoder (always MessagePack for snapshots)
     var encoder = encoder_mod.Encoder.init(
@@ -713,6 +728,12 @@ fn publishSnapshotMetadata(
     try meta_map.put("batch_count", encoder.createInt(@intCast(batch_count)));
     try meta_map.put("row_count", encoder.createInt(@intCast(row_count)));
     try meta_map.put("table", try encoder.createString(table_name));
+    try meta_map.put("compression_enabled", encoder.createBool(compression_enabled));
+
+    // Add dictionary_id if compression is enabled
+    if (dictionary_id) |dict_id| {
+        try meta_map.put("dictionary_id", try encoder.createString(dict_id));
+    }
 
     const encoded = try encoder.encode(meta_map);
     defer allocator.free(encoded);
@@ -732,11 +753,208 @@ fn publishSnapshotMetadata(
     log.info("📋 Published snapshot metadata → {s}", .{subject});
 }
 
-/// Generate snapshot ID based on current timestamp
+/// Publish snapshot start notification to NATS
+/// This notifies consumers that a snapshot is starting with the LSN watermark
+/// Consumers should filter CDC events with LSN < snapshot_lsn to avoid duplicates
+fn publishSnapshotStart(
+    allocator: std.mem.Allocator,
+    publisher: *nats_publisher.Publisher,
+    table_name: []const u8,
+    snapshot_id: []const u8,
+    lsn: []const u8,
+    format: encoder_mod.Format,
+    dictionary_id: ?[]const u8,
+    compression_enabled: bool,
+) !void {
+    var encoder = encoder_mod.Encoder.init(allocator, format);
+    defer encoder.deinit();
+
+    var start_map = encoder.createMap();
+    defer start_map.free(allocator);
+
+    // Parse PostgreSQL LSN string to u64 integer
+    const lsn_int = try parsePgLsn(lsn);
+
+    try start_map.put("snapshot_id", try encoder.createString(snapshot_id));
+    try start_map.put("table", try encoder.createString(table_name));
+    try start_map.put("lsn", encoder.createInt(@intCast(lsn_int)));
+    try start_map.put("timestamp", encoder.createInt(std.time.timestamp()));
+    try start_map.put("status", try encoder.createString("starting"));
+    try start_map.put("format", try encoder.createString(@tagName(format)));
+    try start_map.put("compression_enabled", encoder.createBool(compression_enabled));
+
+    // Add dictionary_id if compression is enabled
+    if (dictionary_id) |dict_id| {
+        try start_map.put("dictionary_id", try encoder.createString(dict_id));
+    }
+
+    const encoded = try encoder.encode(start_map);
+    defer allocator.free(encoded);
+
+    const subject = try std.fmt.allocPrintSentinel(
+        allocator,
+        config.Snapshot.start_subject_pattern,
+        .{table_name},
+        0,
+    );
+    defer allocator.free(subject);
+
+    try publisher.publish(subject, encoded, null);
+    try publisher.flushAsync();
+
+    log.info("🚀 Published snapshot start → {s} (LSN watermark: {s})", .{ subject, lsn });
+}
+
+/// Generate snapshot ID based on current timestamp with random entropy
+/// Format: snap-{timestamp}-{random_u16}
+/// Prevents collisions when multiple snapshots are requested in the same second
 fn generateSnapshotId(allocator: std.mem.Allocator) ![]const u8 {
+    var prng = std.Random.DefaultPrng.init(@intCast(std.time.microTimestamp()));
+    const random_suffix = prng.random().int(u16);
+
     return try std.fmt.allocPrint(
         allocator,
-        "snap-{d}",
-        .{std.time.timestamp()},
+        "snap-{d}-{x:0>4}",
+        .{ std.time.timestamp(), random_suffix },
     );
+}
+
+/// Initialize dictionaries by checking existence in NATS KV store
+/// Called once at bridge startup to verify dictionaries are available
+/// Does not cache dictionaries - they are fetched on-demand per snapshot
+pub fn initializeDictionaries(
+    allocator: std.mem.Allocator,
+    js_ctx: ?*anyopaque,
+    monitored_tables: []const []const u8,
+) !void {
+    if (js_ctx == null) {
+        log.warn("⚠️  JetStream context not available, skipping dictionary initialization", .{});
+        return;
+    }
+
+    log.info("🔍 Checking dictionaries in NATS KV store for {d} tables", .{monitored_tables.len});
+
+    // Open dictionaries KV bucket
+    const bucket_name = try allocator.dupeZ(u8, config.Snapshot.kv_bucket_dictionaries);
+    defer allocator.free(bucket_name);
+
+    var kv_store = nats_kv.KVStore.open(js_ctx.?, bucket_name, allocator) catch |err| {
+        log.warn("⚠️  Failed to open dictionaries KV bucket: {} (compression will work without dictionaries)", .{err});
+        return; // Graceful degradation
+    };
+    defer kv_store.deinit();
+
+    var found_count: usize = 0;
+    var missing_count: usize = 0;
+
+    for (monitored_tables) |table_name| {
+        // Generate dictionary ID for this table
+        const dict_id = try std.fmt.allocPrint(allocator, "dict_{s}_001", .{table_name});
+        defer allocator.free(dict_id);
+
+        const dict_key = try allocator.dupeZ(u8, dict_id);
+        defer allocator.free(dict_key);
+
+        // Check if dictionary exists
+        const dict_data = kv_store.get(dict_key) catch |err| {
+            log.warn("⚠️  Dictionary check failed for table '{s}' (key={s}): {}", .{
+                table_name,
+                dict_id,
+                err,
+            });
+            missing_count += 1;
+            continue;
+        };
+
+        if (dict_data) |data| {
+            defer allocator.free(data);
+            log.info("✅ Dictionary found for table '{s}' (id={s}, size={d} bytes)", .{
+                table_name,
+                dict_id,
+                data.len,
+            });
+            found_count += 1;
+        } else {
+            log.warn("⚠️  No dictionary found for table '{s}' (key={s})", .{
+                table_name,
+                dict_id,
+            });
+            missing_count += 1;
+        }
+    }
+
+    if (found_count == monitored_tables.len) {
+        log.info("✅ All {d} dictionaries available in NATS KV", .{found_count});
+    } else if (found_count > 0) {
+        log.warn("⚠️  {d}/{d} dictionaries available ({d} missing)", .{
+            found_count,
+            monitored_tables.len,
+            missing_count,
+        });
+    } else {
+        log.warn("⚠️  No dictionaries found for any tables (compression will work without dictionaries)", .{});
+    }
+}
+
+/// Generate dictionary ID from table name
+/// Format: {table}_dict
+fn generateDictionaryId(allocator: std.mem.Allocator, table_name: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(allocator, "{s}_dict", .{table_name});
+}
+
+/// Fetch zstd dictionary from NATS KV store
+/// Returns dictionary entry with ID and binary data, or null if not found (graceful degradation)
+fn fetchDictionary(
+    allocator: std.mem.Allocator,
+    js_ctx: *anyopaque,
+    table_name: []const u8,
+) !?struct { dict_id: []const u8, data: []const u8 } {
+    // Generate dictionary ID for this table (e.g., "dict_users_001")
+    // The version number is managed externally when training dictionaries
+    const dict_id = try std.fmt.allocPrint(allocator, "dict_{s}_001", .{table_name});
+    errdefer allocator.free(dict_id);
+
+    // Open dictionaries KV bucket
+    const bucket_name = try allocator.dupeZ(u8, config.Snapshot.kv_bucket_dictionaries);
+    defer allocator.free(bucket_name);
+
+    var kv_store = nats_kv.KVStore.open(js_ctx, bucket_name, allocator) catch |err| {
+        log.warn("Failed to open dictionaries KV bucket: {} (compression will work without dictionary)", .{err});
+        return null; // Graceful degradation
+    };
+    defer kv_store.deinit();
+
+    // Fetch dictionary from KV
+    const dict_key = try allocator.dupeZ(u8, dict_id);
+    defer allocator.free(dict_key);
+
+    const dict_data = kv_store.get(dict_key) catch |err| {
+        log.warn("Failed to fetch dictionary for table '{s}' (key={s}): {} (compression will work without dictionary)", .{
+            table_name,
+            dict_id,
+            err,
+        });
+        allocator.free(dict_id);
+        return null; // Graceful degradation
+    };
+
+    if (dict_data == null) {
+        log.warn("No dictionary found for table '{s}' (key={s}) (compression will work without dictionary)", .{
+            table_name,
+            dict_id,
+        });
+        allocator.free(dict_id);
+        return null;
+    }
+
+    log.info("📚 Fetched dictionary for table '{s}' from KV (id={s}, size={d} bytes)", .{
+        table_name,
+        dict_id,
+        dict_data.?.len,
+    });
+
+    return .{
+        .dict_id = dict_id, // Caller owns
+        .data = dict_data.?, // Caller owns
+    };
 }
