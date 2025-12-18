@@ -1,5 +1,6 @@
 //! Bridge application that streams PostgreSQL CDC events to NATS JetStream using pgoutput format
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const Config = @import("config.zig");
 const wal_stream = @import("wal_stream.zig");
@@ -151,7 +152,7 @@ fn initReplicationStream(
 }
 
 pub fn main() !void {
-    const IS_DEBUG = @import("builtin").mode == .Debug;
+    const IS_DEBUG = builtin.mode == .Debug;
 
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     const allocator = if (IS_DEBUG) gpa.allocator() else std.heap.c_allocator;
@@ -159,6 +160,16 @@ pub fn main() !void {
     defer if (IS_DEBUG) {
         _ = gpa.detectLeaks();
     };
+
+    var tsa = std.heap.ThreadSafeAllocator{ .child_allocator = gpa.allocator() };
+
+    // CDC event allocator
+    // Debug: Use ThreadSafeAllocator for leak detection
+    // Release: Use c_allocator directly (arena without reset was growing infinitely)
+    const event_alloc = if (IS_DEBUG)
+        tsa.allocator()
+    else
+        std.heap.c_allocator;
 
     // Parse command-line arguments and build runtime config
     const parsed = try args.Args.parseArgs(allocator);
@@ -291,7 +302,7 @@ pub fn main() !void {
     // Use c_allocator (thread-safe) for cross-thread allocations:
     // Main thread allocates CDC event data, flush thread deallocates it
     var batch_pub = try initBatchPublisher(
-        std.heap.c_allocator,
+        event_alloc,
         &publisher,
         parsed_args.encoding_format,
         &metrics,
@@ -305,7 +316,7 @@ pub fn main() !void {
     // === Initialize EventProcessor (main thread CDC processor)
     // EventProcessor enqueues to the SPSC queue that BatchPublisher consumes
     var event_proc = event_processor.EventProcessor.init(
-        std.heap.c_allocator, // Use thread-safe allocator for cross-thread data
+        event_alloc, // Use thread-safe allocator for cross-thread data
         &batch_pub.event_queue, // Reference to the SPSC queue
         &metrics,
     );
@@ -371,7 +382,7 @@ pub fn main() !void {
         relation_map.deinit();
     }
 
-    // Create arena allocator once
+    // Create arena allocator for messages parsing
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
@@ -381,6 +392,13 @@ pub fn main() !void {
         if (batch_pub.hasFatalError()) {
             log.err("🔴 FATAL ERROR: NATS reconnection failed - shutting down bridge to prevent WAL overflow", .{});
             break;
+        }
+
+        // Reclaim published events from flush thread (memory ownership cycle)
+        // Now actually frees memory since we're using c_allocator directly
+        const reclaimed = batch_pub.reclaimEvents();
+        if (reclaimed > 0) {
+            log.debug("Reclaimed and freed {d} published events", .{reclaimed});
         }
 
         if (pg_stream.receiveMessage()) |maybe_msg| {
@@ -586,6 +604,10 @@ pub fn main() !void {
             log.warn("Connection lost: {}", .{err});
             metrics.setConnected(false);
             log.info("Attempting to reconnect in 2 seconds...", .{});
+
+            // Reclaim events during idle time
+            _ = batch_pub.reclaimEvents();
+
             std.Thread.sleep(2000 * std.time.ns_per_ms); // 2 seconds
 
             // Get latest LSN and reconnect

@@ -150,7 +150,13 @@ pub const BatchPublisher = struct {
     // Lock-free event queue (SPSC: Single Producer Single Consumer)
     // Producer: Main thread (via EventProcessor)
     // Consumer: Flush thread (this thread)
-    event_queue: SPSCQueue(CDCEvent),
+    // Now uses pointers to avoid copying CDCEvent structs
+    event_queue: SPSCQueue(*CDCEvent),
+
+    // Reclaim queue for memory ownership cycle
+    // Flush thread returns pointers here after publishing
+    // Main thread reclaims and frees in idle loops
+    reclaim_queue: SPSCQueue(*CDCEvent),
 
     // Atomic state shared between threads
     last_confirmed_lsn: std.atomic.Value(u64), // Last LSN confirmed by NATS
@@ -169,8 +175,12 @@ pub const BatchPublisher = struct {
         metrics: ?*Metrics,
         runtime_config: *const Config.RuntimeConfig,
     ) !BatchPublisher {
-        // Initialize lock-free queue with power-of-2 capacity from runtime config
-        const event_queue = try SPSCQueue(CDCEvent).init(
+        // Initialize lock-free queues with power-of-2 capacity from runtime config
+        const event_queue = try SPSCQueue(*CDCEvent).init(
+            allocator,
+            runtime_config.batch_ring_buffer_size,
+        );
+        const reclaim_queue = try SPSCQueue(*CDCEvent).init(
             allocator,
             runtime_config.batch_ring_buffer_size,
         );
@@ -182,6 +192,7 @@ pub const BatchPublisher = struct {
             .format = format,
             .metrics = metrics,
             .event_queue = event_queue,
+            .reclaim_queue = reclaim_queue,
             .last_confirmed_lsn = std.atomic.Value(u64).init(0),
             .fatal_error = std.atomic.Value(bool).init(false),
             .flush_complete = std.atomic.Value(bool).init(false),
@@ -211,25 +222,33 @@ pub const BatchPublisher = struct {
 
     /// Deinit - cleanup resources (call after join)
     pub fn deinit(self: *BatchPublisher) void {
-        // Clean up any remaining events in the queue
-        while (self.event_queue.pop()) |event| {
-            var mut_event = event;
-            mut_event.deinit(self.allocator);
+        // Clean up any remaining events in the event queue
+        while (self.event_queue.pop()) |event_ptr| {
+            event_ptr.deinit(self.allocator);
+            self.allocator.destroy(event_ptr);
         }
 
-        // Deinit the queue itself
+        // Clean up any remaining events in the reclaim queue
+        while (self.reclaim_queue.pop()) |event_ptr| {
+            event_ptr.deinit(self.allocator);
+            self.allocator.destroy(event_ptr);
+        }
+
+        // Deinit the queues themselves
         self.event_queue.deinit();
+        self.reclaim_queue.deinit();
 
         log.info("🥁 Batch publisher stopped", .{});
     }
 
     /// Add an event to the batch (called from flush thread)
+    /// Now works with event pointers
     fn addToBatch(
-        batch: *std.ArrayList(CDCEvent),
-        event: CDCEvent,
+        batch: *std.ArrayList(*CDCEvent),
+        event_ptr: *CDCEvent,
         allocator: std.mem.Allocator,
     ) !void {
-        try batch.append(allocator, event);
+        try batch.append(allocator, event_ptr);
     }
 
     /// Get the last LSN that was successfully confirmed by NATS
@@ -245,6 +264,11 @@ pub const BatchPublisher = struct {
         return @as(f64, @floatFromInt(current_len)) / @as(f64, @floatFromInt(capacity));
     }
 
+    /// Check if both queues are empty (safe point for arena reset)
+    pub fn queuesEmpty(self: *BatchPublisher) bool {
+        return self.event_queue.isEmpty() and self.reclaim_queue.isEmpty();
+    }
+
     /// Check if a fatal error occurred (e.g., NATS reconnection timeout)
     pub fn hasFatalError(self: *BatchPublisher) bool {
         return self.fatal_error.load(.seq_cst);
@@ -255,6 +279,23 @@ pub const BatchPublisher = struct {
         return self.flush_complete.load(.seq_cst);
     }
 
+    /// Reclaim published events from the reclaim queue (called from main thread)
+    /// Returns number of events reclaimed and freed
+    /// Batches reclamation to reduce overhead
+    pub fn reclaimEvents(self: *BatchPublisher) usize {
+        var count: usize = 0;
+        const max_reclaim_per_call: usize = 100; // Limit reclamation per call to avoid blocking
+
+        while (count < max_reclaim_per_call) {
+            const event_ptr = self.reclaim_queue.pop() orelse break;
+            // Free individual allocations (no-op for ArenaAllocator)
+            event_ptr.deinit(self.allocator);
+            self.allocator.destroy(event_ptr);
+            count += 1;
+        }
+        return count;
+    }
+
     /// Background thread that continuously drains events from lock-free queue and flushes to NATS
     fn flushLoop(self: *BatchPublisher) void {
         log.info("ℹ️ Lock-free flush thread started", .{});
@@ -262,13 +303,18 @@ pub const BatchPublisher = struct {
         var batches_processed: usize = 0;
         var last_flush_time = std.time.milliTimestamp();
 
-        // Persistent batch that accumulates events across iterations
-        var batch = std.ArrayList(CDCEvent){};
+        // Persistent batch that accumulates event pointers across iterations
+        var batch = std.ArrayList(*CDCEvent){};
         var current_payload_size: usize = 0; // Track approximate payload size
         defer {
-            // Clean up on thread exit
-            for (batch.items) |*event| {
-                event.deinit(self.allocator);
+            // Clean up on thread exit - return pointers to reclaim queue
+            for (batch.items) |event_ptr| {
+                self.reclaim_queue.push(event_ptr) catch |err| {
+                    log.err("Failed to reclaim event on thread exit: {}", .{err});
+                    // Last resort - free directly
+                    event_ptr.deinit(self.allocator);
+                    self.allocator.destroy(event_ptr);
+                };
             }
             batch.deinit(self.allocator);
         }
@@ -278,16 +324,19 @@ pub const BatchPublisher = struct {
             while (batch.items.len < self.config.max_events and
                 current_payload_size < self.config.max_payload_bytes)
             {
-                const event = self.event_queue.pop() orelse break;
+                const event_ptr = self.event_queue.pop() orelse break;
 
                 // Approximate payload size (table + operation + subject strings)
-                const event_size = event.table.len + event.operation.len + event.subject.len;
+                const event_size = event_ptr.table.len + event_ptr.operation.len + event_ptr.subject.len;
 
-                addToBatch(&batch, event, self.allocator) catch |err| {
+                addToBatch(&batch, event_ptr, self.allocator) catch |err| {
                     log.err("⚠️ Failed to append to batch: {}", .{err});
-                    // Clean up event on error
-                    var mut_event = event;
-                    mut_event.deinit(self.allocator);
+                    // Return to reclaim queue on error
+                    self.reclaim_queue.push(event_ptr) catch {
+                        // Last resort - free directly
+                        event_ptr.deinit(self.allocator);
+                        self.allocator.destroy(event_ptr);
+                    };
                     break;
                 };
 
@@ -360,11 +409,14 @@ pub const BatchPublisher = struct {
         log.info("Flush thread shutting down, draining remaining events...", .{});
 
         // Drain remaining events into the existing batch
-        while (self.event_queue.pop()) |event| {
-            addToBatch(&batch, event, self.allocator) catch |err| {
+        while (self.event_queue.pop()) |event_ptr| {
+            addToBatch(&batch, event_ptr, self.allocator) catch |err| {
                 log.err("⚠️ Failed to append final event: {}", .{err});
-                var mut_event = event;
-                mut_event.deinit(self.allocator);
+                // Return to reclaim queue
+                self.reclaim_queue.push(event_ptr) catch {
+                    event_ptr.deinit(self.allocator);
+                    self.allocator.destroy(event_ptr);
+                };
                 break;
             };
         }
@@ -386,15 +438,20 @@ pub const BatchPublisher = struct {
     }
 
     /// Flush a batch to NATS (runs in flush thread)
-    /// Takes a pointer to the batch ArrayList and clears it after flushing (retaining capacity)
-    fn flushBatch(self: *BatchPublisher, batch: *std.ArrayList(CDCEvent)) !void {
+    /// Takes a pointer to the batch ArrayList of event pointers
+    /// Returns event pointers to reclaim queue after flushing
+    fn flushBatch(self: *BatchPublisher, batch: *std.ArrayList(*CDCEvent)) !void {
         if (batch.items.len == 0) return;
+
+        // Use allocator directly (flush arena caused segfault due to premature freeing)
+        // NATS C library may hold references to strings after publish() returns
+        const flush_alloc = self.allocator;
 
         // Calculate maximum LSN in this batch
         var max_lsn: u64 = 0;
-        for (batch.items) |event| {
-            if (event.lsn > max_lsn) {
-                max_lsn = event.lsn;
+        for (batch.items) |event_ptr| {
+            if (event_ptr.lsn > max_lsn) {
+                max_lsn = event_ptr.lsn;
             }
         }
 
@@ -405,24 +462,24 @@ pub const BatchPublisher = struct {
 
         // For single event, encode and publish directly
         if (event_count == 1) {
-            const event = batch.items[0];
+            const event_ptr = batch.items[0];
 
-            // Use unified encoder
-            var encoder = encoder_mod.Encoder.init(self.allocator, self.format);
+            // Use unified encoder with flush arena
+            var encoder = encoder_mod.Encoder.init(flush_alloc, self.format);
             defer encoder.deinit();
 
             var event_map = encoder.createMap();
-            defer event_map.free(self.allocator);
+            defer event_map.free(flush_alloc);
 
-            try event_map.put("subject", try encoder.createString(event.subject));
-            try event_map.put("table", try encoder.createString(event.table));
-            try event_map.put("operation", try encoder.createString(event.operation));
-            try event_map.put("msg_id", try encoder.createString(event.msg_id));
-            try event_map.put("relation_id", encoder.createInt(@intCast(event.relation_id)));
-            try event_map.put("lsn", encoder.createInt(@intCast(event.lsn)));
+            try event_map.put("subject", try encoder.createString(event_ptr.subject));
+            try event_map.put("table", try encoder.createString(event_ptr.table));
+            try event_map.put("operation", try encoder.createString(event_ptr.operation));
+            try event_map.put("msg_id", try encoder.createString(event_ptr.msg_id));
+            try event_map.put("relation_id", encoder.createInt(@intCast(event_ptr.relation_id)));
+            try event_map.put("lsn", encoder.createInt(@intCast(event_ptr.lsn)));
 
             // Add column data if present
-            if (event.data) |columns| {
+            if (event_ptr.data) |columns| {
                 log.debug("Single event has {d} columns", .{columns.items.len});
                 var data_map = encoder.createMap();
 
@@ -437,36 +494,36 @@ pub const BatchPublisher = struct {
             const encoded = try encoder.encode(event_map);
             defer self.allocator.free(encoded);
 
-            try self.publisher.publish(event.subject, encoded, event.msg_id);
+            try self.publisher.publish(event_ptr.subject, encoded, event_ptr.msg_id);
 
             // Flush async publishes to actually send them to NATS
             try self.publisher.flushAsync();
 
-            log.debug("Published single event: {s}", .{event.subject});
+            log.debug("Published single event: {s}", .{event_ptr.subject});
         } else {
-            // Use unified encoder for batch publishing
-            var encoder = encoder_mod.Encoder.init(self.allocator, self.format);
+            // Use unified encoder for batch publishing with flush arena
+            var encoder = encoder_mod.Encoder.init(flush_alloc, self.format);
             defer encoder.deinit();
 
             // Create array of events
             var batch_array = try encoder.createArray(event_count);
-            defer batch_array.free(self.allocator);
+            defer batch_array.free(flush_alloc);
 
             const encode_start = std.time.milliTimestamp();
 
-            for (batch.items, 0..) |event, i| {
+            for (batch.items, 0..) |event_ptr, i| {
                 // Each event is a map with subject, table, operation, msg_id, and data
                 var event_map = encoder.createMap();
 
-                try event_map.put("subject", try encoder.createString(event.subject));
-                try event_map.put("table", try encoder.createString(event.table));
-                try event_map.put("operation", try encoder.createString(event.operation));
-                try event_map.put("msg_id", try encoder.createString(event.msg_id));
-                try event_map.put("relation_id", encoder.createInt(@intCast(event.relation_id)));
-                try event_map.put("lsn", encoder.createInt(@intCast(event.lsn)));
+                try event_map.put("subject", try encoder.createString(event_ptr.subject));
+                try event_map.put("table", try encoder.createString(event_ptr.table));
+                try event_map.put("operation", try encoder.createString(event_ptr.operation));
+                try event_map.put("msg_id", try encoder.createString(event_ptr.msg_id));
+                try event_map.put("relation_id", encoder.createInt(@intCast(event_ptr.relation_id)));
+                try event_map.put("lsn", encoder.createInt(@intCast(event_ptr.lsn)));
 
                 // Add column data if present
-                if (event.data) |columns| {
+                if (event_ptr.data) |columns| {
                     var data_map = encoder.createMap();
 
                     for (columns.items) |column| {
@@ -490,7 +547,7 @@ pub const BatchPublisher = struct {
             const first_msg_id = batch.items[0].msg_id;
             const last_msg_id = batch.items[event_count - 1].msg_id;
             const batch_msg_id = try std.fmt.allocPrint(
-                self.allocator,
+                flush_alloc,
                 "batch-{s}-to-{s}",
                 .{ first_msg_id, last_msg_id },
             );
@@ -498,7 +555,7 @@ pub const BatchPublisher = struct {
 
             // Use first event's subject pattern but with .batch suffix
             const batch_subject = try std.fmt.allocPrintSentinel(
-                self.allocator,
+                flush_alloc,
                 "{s}.batch",
                 .{batch.items[0].subject},
                 0,
@@ -530,11 +587,17 @@ pub const BatchPublisher = struct {
         // This happens in publisher.flushAsync() which throws error.FlushFailed
         // If we got here without error, the flush succeeded
 
-        log.info("Cleaning up {d} events after successful flush", .{event_count});
+        log.debug("Returning {d} events to reclaim queue", .{event_count});
 
-        // Clean up events
-        for (batch.items) |*event| {
-            event.deinit(self.allocator);
+        // Return event pointers to reclaim queue instead of freeing
+        // Main thread will reclaim and free them
+        for (batch.items) |event_ptr| {
+            self.reclaim_queue.push(event_ptr) catch |err| {
+                log.err("Failed to push to reclaim queue: {}", .{err});
+                // Last resort - free directly (should rarely happen)
+                event_ptr.deinit(self.allocator);
+                self.allocator.destroy(event_ptr);
+            };
         }
         batch.clearRetainingCapacity();
 

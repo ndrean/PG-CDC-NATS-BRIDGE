@@ -16,12 +16,12 @@ pub const log = std.log.scoped(.event_processor);
 /// Decodes pgoutput tuples, creates CDC events, and enqueues them to the SPSC queue
 pub const EventProcessor = struct {
     allocator: std.mem.Allocator,
-    event_queue: *SPSCQueue(batch_publisher.CDCEvent),
+    event_queue: *SPSCQueue(*batch_publisher.CDCEvent),
     metrics: ?*Metrics, // Optional metrics reference
 
     pub fn init(
         allocator: std.mem.Allocator,
-        event_queue: *SPSCQueue(batch_publisher.CDCEvent),
+        event_queue: *SPSCQueue(*batch_publisher.CDCEvent),
         metrics: ?*Metrics,
     ) EventProcessor {
         return .{
@@ -137,6 +137,7 @@ pub const EventProcessor = struct {
 
     /// Add an event to the lock-free queue. Wait-free operation (no locks, no blocking).
     /// Takes ownership of the `data` ArrayList - caller must not free it.
+    /// Allocates event on heap and pushes pointer to queue.
     fn addEvent(
         self: *EventProcessor,
         subject: []const u8,
@@ -163,7 +164,11 @@ pub const EventProcessor = struct {
         const owned_msg_id = try self.allocator.dupe(u8, msg_id);
         errdefer self.allocator.free(owned_msg_id);
 
-        const event = batch_publisher.CDCEvent{
+        // Allocate event on heap instead of stack
+        const event_ptr = try self.allocator.create(batch_publisher.CDCEvent);
+        errdefer self.allocator.destroy(event_ptr);
+
+        event_ptr.* = batch_publisher.CDCEvent{
             .subject = owned_subject,
             .table = owned_table,
             .operation = owned_operation,
@@ -172,16 +177,16 @@ pub const EventProcessor = struct {
             .data = data, // Transfer ownership - no copy!
             .lsn = lsn,
         };
-        // If push fails with unexpected error, clean up the event (including the hashmap we now own)
+        // If push fails with unexpected error, clean up the event
         errdefer {
-            var mut_event = event;
-            mut_event.deinit(self.allocator);
+            event_ptr.deinit(self.allocator);
+            self.allocator.destroy(event_ptr);
         }
 
-        // Push to lock-free queue with backpressure retry
+        // Push pointer to lock-free queue with backpressure retry
         var retry_count: usize = 0;
         while (true) {
-            self.event_queue.push(event) catch |err| {
+            self.event_queue.push(event_ptr) catch |err| {
                 if (err == error.QueueFull) {
                     retry_count += 1;
 
@@ -209,6 +214,6 @@ pub const EventProcessor = struct {
             break;
         }
 
-        log.debug("Event added to lock-free queue", .{});
+        log.debug("Event pointer added to lock-free queue", .{});
     }
 };

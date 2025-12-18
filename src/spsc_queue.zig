@@ -7,6 +7,8 @@ const std = @import("std");
 /// - Producer: Main thread adding WAL events to batch
 /// - Consumer: Flush thread publishing batches to NATS
 ///
+/// It stores values, not pointers. The rung buffer
+///
 /// Memory ordering:
 /// - Producer uses .release on write_index to ensure data is visible before index
 /// - Consumer uses .acquire on write_index to ensure it sees the data
