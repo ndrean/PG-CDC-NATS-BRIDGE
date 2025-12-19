@@ -26,3 +26,4 @@ scripts/
 .dockerignore
 .env.example
 *.yml
+/demo/
