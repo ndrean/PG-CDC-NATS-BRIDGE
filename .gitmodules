@@ -1,0 +1,3 @@
+[submodule "src/nats"]
+	path = src/nats
+	url = https://github.com/g41797/nats/tree/main
